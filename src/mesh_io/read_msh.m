@@ -1,7 +1,10 @@
 function MeshRaw = read_msh(filename)
-% READ_MSH 读取 Gmsh .msh 文件 (支持 Format 4.1) - 高性能版
-% 优化: 将 str2num 替换为 sscanf，显著提升头部解析速度
-% 修正: 保持了对换行符的健壮处理
+% READ_MSH 读取 Gmsh .msh 文件 (项目内部专用格式修正版)
+% 
+% 修正:
+% 1. read_nodes: 修改为读取 "ID X Y Z" 格式 (4列数据)，适配 create_delaunay_mesh_robust 的输出。
+% 2. 保持了 read_elements 对交替格式的支持。
+% 3. 这是一个高性能版本，使用 sscanf/fscanf 加速。
 
     if ~isfile(filename)
         error('文件未找到: %s', filename);
@@ -11,10 +14,10 @@ function MeshRaw = read_msh(filename)
     cleanup = onCleanup(@() fclose(fid));
     
     MeshRaw.P = [];
-    MeshRaw.T = [];           % Tet4 单元
-    MeshRaw.RegionTags = [];  % Tet4 物理标签
-    MeshRaw.Faces = [];       % Tri3 单元 (边界)
-    MeshRaw.FaceTags = [];    % Tri3 物理标签 (边界)
+    MeshRaw.T = [];           % Tet4
+    MeshRaw.RegionTags = [];  % Tet4 Tags
+    MeshRaw.Faces = [];       % Tri3
+    MeshRaw.FaceTags = [];    % Tri3 Tags
     
     while ~feof(fid)
         line = strtrim(fgetl(fid));
@@ -28,10 +31,9 @@ function MeshRaw = read_msh(filename)
     end
     
     % -------------------------------------------------------
-    % 内部函数: 读取节点
+    % 内部函数: 读取节点 (修正版)
     % -------------------------------------------------------
     function read_nodes()
-        % 使用 sscanf 替代 str2num 解析 "numBlocks numNodes ..."
         header = sscanf(fgetl(fid), '%f'); 
         if isempty(header), return; end
         
@@ -42,20 +44,27 @@ function MeshRaw = read_msh(filename)
         cnt = 0;
         
         for i = 1:numBlocks
-            % 解析块信息: entityDim entityTag parametric numNodesInBlock
+            % 块头: dim tag parametric numNodesInBlock
             info = sscanf(fgetl(fid), '%f');
-            if isempty(info), info = sscanf(fgetl(fid), '%f'); end % 跳过可能的空行
+            if isempty(info), info = sscanf(fgetl(fid), '%f'); end
             
             nInBlock = info(4);
             
-            % 读取并跳过 Node Tags
-            textscan(fid, '%d', nInBlock); 
+            % [修正]: 假设文件格式为每行 "ID X Y Z" (共4个数)
+            % 之前的代码假设 Tags 和 Coords 是分开的 (Gmsh 4.1 标准)，这里改为适应生成器
             
-            % 读取坐标
-            data = fscanf(fid, '%f', 3 * nInBlock);
-            P_all(:, cnt+1 : cnt+nInBlock) = reshape(data, 3, nInBlock);
+            % 读取 4 * N 个浮点数
+            data = fscanf(fid, '%f', 4 * nInBlock);
             
-            % 吃掉行末的换行符
+            % 重塑为 4 x N 矩阵
+            % Row 1: ID
+            % Row 2: X, Row 3: Y, Row 4: Z
+            data = reshape(data, 4, nInBlock);
+            
+            % 提取坐标 (2:4 行)
+            P_all(:, cnt+1 : cnt+nInBlock) = data(2:4, :);
+            
+            % 吃掉换行符
             fgetl(fid); 
             
             cnt = cnt + nInBlock;
@@ -75,43 +84,37 @@ function MeshRaw = read_msh(filename)
         T_list = {}; Tag_list = {}; 
         F_list = {}; FTag_list = {}; 
         
-        totalTets = 0;
-        totalTris = 0;
+        totalTets = 0; totalTris = 0;
         
         for i = 1:numBlocks
-            % 读取块信息头
             lineStr = fgetl(fid);
             info = sscanf(lineStr, '%f');
-            
-            % 如果读到了空行，再读一次
-            if isempty(info)
-                info = sscanf(fgetl(fid), '%f'); 
-            end
+            if isempty(info), info = sscanf(fgetl(fid), '%f'); end
             
             entTag = info(2); 
             elemType = info(3);
             nInBlock = info(4);
             
-            if elemType == 4 % 4-node Tetrahedron
+            if elemType == 4 % Tet4 (ID + 4 Nodes = 5 cols)
                 data = fscanf(fid, '%d', 5 * nInBlock);
                 data = reshape(data, 5, nInBlock);
-                T_list{end+1} = data(2:5, :); %#ok<AGROW>
-                Tag_list{end+1} = repmat(entTag, 1, nInBlock); %#ok<AGROW>
+                
+                T_list{end+1} = data(2:5, :); 
+                Tag_list{end+1} = repmat(entTag, 1, nInBlock); 
                 totalTets = totalTets + nInBlock;
+                fgetl(fid);
                 
-                fgetl(fid); % 吃掉换行符
-                
-            elseif elemType == 2 % 3-node Triangle
+            elseif elemType == 2 % Tri3 (ID + 3 Nodes = 4 cols)
                 data = fscanf(fid, '%d', 4 * nInBlock);
                 data = reshape(data, 4, nInBlock);
-                F_list{end+1} = data(2:4, :); %#ok<AGROW>
-                FTag_list{end+1} = repmat(entTag, 1, nInBlock); %#ok<AGROW>
-                totalTris = totalTris + nInBlock;
                 
-                fgetl(fid); % 吃掉换行符
+                F_list{end+1} = data(2:4, :); 
+                FTag_list{end+1} = repmat(entTag, 1, nInBlock); 
+                totalTris = totalTris + nInBlock;
+                fgetl(fid);
                 
             else
-                % 跳过不支持的单元类型
+                % Skip unknown (estimate line length)
                 nodesPerElem = 0;
                 if elemType == 1, nodesPerElem = 2;
                 elseif elemType == 15, nodesPerElem = 1;
@@ -119,7 +122,7 @@ function MeshRaw = read_msh(filename)
                 
                 if nodesPerElem > 0
                     fscanf(fid, '%d', (1 + nodesPerElem) * nInBlock);
-                    fgetl(fid); % 吃掉换行符
+                    fgetl(fid); 
                 end
             end
         end
