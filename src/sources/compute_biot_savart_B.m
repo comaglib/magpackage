@@ -1,15 +1,21 @@
 function B_field = compute_biot_savart_B(CoilSegments, TargetPoints)
-% COMPUTE_BIOT_SAVART_B 计算线圈在目标点产生的磁通密度 B (HPC修正版 v2)
+% COMPUTE_BIOT_SAVART_B 计算线圈在目标点产生的磁通密度 B (HPC修正版)
 % 
-% 修正: 彻底消除 TargetPoints 在 parfor 中的广播开销
+% 修复: 增加对标量 CoilSegments.I 的支持。
 
     mu0 = 4*pi*1e-7;
     ConstFactor = mu0 / (4*pi);
     
-    % 1. 预处理线圈
+    nSegsTotal = size(CoilSegments.P1, 2);
+    
     S1_raw = CoilSegments.P1; 
     S2_raw = CoilSegments.P2;
     I_raw = CoilSegments.I;
+    
+    % [关键修复] 兼容标量电流
+    if isscalar(I_raw)
+        I_raw = repmat(I_raw, 1, nSegsTotal);
+    end
     
     SegVec_raw = S2_raw - S1_raw;
     L_sq = sum(SegVec_raw.^2, 1);
@@ -22,26 +28,23 @@ function B_field = compute_biot_savart_B(CoilSegments, TargetPoints)
     nSegs = size(S1, 2);
     nPoints = size(TargetPoints, 2);
     
-    % 2. 切片 (Pre-chunking)
+    % Pre-chunking
     chunkSize = 10000;
     numChunks = ceil(nPoints / chunkSize);
     TargetBlocks = cell(numChunks, 1);
     for k = 1:numChunks
         idx_s = (k-1)*chunkSize + 1;
         idx_e = min(k*chunkSize, nPoints);
-        % 将切片存入 Cell，切断与原矩阵的联系
         TargetBlocks{k} = TargetPoints(:, idx_s:idx_e);
     end
     
     B_cell = cell(numChunks, 1);
     
-    % 3. 广播常量
     C_S1 = parallel.pool.Constant(S1);
     C_S2 = parallel.pool.Constant(S2);
     C_I = parallel.pool.Constant(I_vec);
     
     parfor k = 1:numChunks
-        % 仅访问 Cell 元素，MATLAB 能够识别
         P_targets = TargetBlocks{k};
         nLocal = size(P_targets, 2);
         B_local = zeros(3, nLocal);

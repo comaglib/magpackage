@@ -1,8 +1,7 @@
 function B_field = compute_biot_savart_B_serial(CoilSegments, TargetPoints)
 % COMPUTE_BIOT_SAVART_B_SERIAL 串行版 (用于 parfor 内部调用)
 % 
-% 这是一个轻量级函数，不使用 parallel.pool，不使用 parfor。
-% 适合在 assemble_rhs_reduced 等函数的 Worker 进程中被调用。
+% 修复: 增加对标量 CoilSegments.I 的支持，防止索引越界。
 
     mu0 = 4*pi*1e-7;
     ConstFactor = mu0 / (4*pi);
@@ -11,6 +10,13 @@ function B_field = compute_biot_savart_B_serial(CoilSegments, TargetPoints)
     S1 = CoilSegments.P1; 
     S2 = CoilSegments.P2;
     I_vec = CoilSegments.I;
+    
+    nSegsTotal = size(S1, 2);
+    
+    % [关键修复] 兼容标量电流输入
+    if isscalar(I_vec)
+        I_vec = repmat(I_vec, 1, nSegsTotal);
+    end
     
     SegVec = S2 - S1;
     L_sq = sum(SegVec.^2, 1);
@@ -25,17 +31,15 @@ function B_field = compute_biot_savart_B_serial(CoilSegments, TargetPoints)
     
     B_field = zeros(3, nPoints);
     
-    % 2. 循环线段 (对所有点向量化)
+    % 2. 循环线段
     for i = 1:nSegs
         p1 = S1(:, i);
         p2 = S2(:, i);
         curr = I_vec(i);
         
-        % R1 = P - p1
         R1 = TargetPoints - p1; 
         R2 = TargetPoints - p2; 
         
-        % Cross Product
         Cx = R1(2,:).*R2(3,:) - R1(3,:).*R2(2,:);
         Cy = R1(3,:).*R2(1,:) - R1(1,:).*R2(3,:);
         Cz = R1(1,:).*R2(2,:) - R1(2,:).*R2(1,:);

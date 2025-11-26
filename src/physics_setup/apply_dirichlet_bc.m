@@ -15,7 +15,7 @@ function [K, b] = apply_dirichlet_bc(K, b, dof_indices, values)
         return;
     end
     
-    fprintf('  - 正在施加 Dirichlet 边界条件 (Fixed DoFs: %d)...\n', length(dof_indices));
+    % fprintf('  - 正在施加 Dirichlet 边界条件 (Fixed DoFs: %d)...\n', length(dof_indices));
     
     N = size(K, 1);
     
