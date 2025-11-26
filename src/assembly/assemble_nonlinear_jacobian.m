@@ -1,5 +1,5 @@
 function [K_tan, Res] = assemble_nonlinear_jacobian(Model, x, b_ext)
-% ASSEMBLE_NONLINEAR_JACOBIAN 组装非线性切线刚度矩阵和残差向量
+% ASSEMBLE_NONLINEAR_JACOBIAN 组装非线性切线刚度矩阵和残差向量 (HPC优化版)
 %
 % 输入:
 %   Model  - 模型结构体
@@ -9,10 +9,13 @@ function [K_tan, Res] = assemble_nonlinear_jacobian(Model, x, b_ext)
 % 输出:
 %   K_tan  - 切线刚度矩阵 (Jacobian)
 %   Res    - 残差向量 (Internal Force - External Force)
+%
+% 优化:
+%   1. 使用 Cell 预分块消除 T, T2E, Signs, ElemA 的广播。
+%   2. 使用 parallel.pool.Constant 封装 MatLib 和 P。
 
     % fprintf('  [Assembly] Assembling Jacobian and Residual...\n');
-    % t_start = tic;
-
+    
     Mesh = Model.Mesh;
     
     % 1. 全局数据准备
@@ -22,16 +25,16 @@ function [K_tan, Res] = assemble_nonlinear_jacobian(Model, x, b_ext)
     ElemA = prepare_element_A(Model, x);
     
     % 提取拓扑与材料映射
-    T = Mesh.T;
-    T2E = Mesh.T2E;
-    Signs = double(Mesh.T2E_Sign);
-    MatMap = Model.Materials.ActiveMap;
-    MatLib = Model.Materials.Lib;
+    T_raw = Mesh.T;
+    T2E_raw = Mesh.T2E;
+    Signs_raw = double(Mesh.T2E_Sign);
+    MatMap_raw = Model.Materials.ActiveMap;
     
-    % P 需要广播，封装
+    % [优化点] 封装广播变量
     C_P = parallel.pool.Constant(Mesh.P);
+    C_MatLib = parallel.pool.Constant(Model.Materials.Lib);
     
-    numElems = size(T, 2);
+    numElems = size(T_raw, 2);
     numEdges = size(Mesh.Edges, 2);
     
     % 2. 数据预分块 (Pre-chunking)
@@ -46,11 +49,12 @@ function [K_tan, Res] = assemble_nonlinear_jacobian(Model, x, b_ext)
         idx_e = min(k*chunkSize, numElems);
         indices = idx_s:idx_e;
         
-        ElementBlocks{k}.T = T(:, indices);
-        ElementBlocks{k}.T2E = T2E(:, indices);
-        ElementBlocks{k}.Signs = Signs(:, indices);
-        ElementBlocks{k}.MatIDs = MatMap(indices);
-        ElementBlocks{k}.A_loc = ElemA(:, indices); % 关键: 只有切片数据传入
+        % 仅切片存储必要数据
+        ElementBlocks{k}.T = T_raw(:, indices);
+        ElementBlocks{k}.T2E = T2E_raw(:, indices);
+        ElementBlocks{k}.Signs = Signs_raw(:, indices);
+        ElementBlocks{k}.MatIDs = MatMap_raw(indices);
+        ElementBlocks{k}.A_loc = ElemA(:, indices); 
         ElementBlocks{k}.Count = length(indices);
     end
     
@@ -60,9 +64,6 @@ function [K_tan, Res] = assemble_nonlinear_jacobian(Model, x, b_ext)
     V_cell = cell(numChunks, 1);     % For Jacobian values
     F_int_cell = cell(numChunks, 1); % For Internal Force values
     idx_F_cell = cell(numChunks, 1); % For Force indices
-    
-    % 广播材料库 (通常很小，直接拷入 Worker 也没问题)
-    % 但为了严谨，我们假设 Lib 可以在 parfor 中只读访问
     
     parfor k = 1:numChunks
         Block = ElementBlocks{k};
@@ -75,12 +76,11 @@ function [K_tan, Res] = assemble_nonlinear_jacobian(Model, x, b_ext)
         loc_MatIDs = Block.MatIDs;
         loc_A = Block.A_loc;
         
+        % 获取常量
         loc_P_all = C_P.Value;
+        loc_MatLib = C_MatLib.Value; % [修复] 在 Worker 端获取本地副本
         
         % 预分配
-        % Jacobian: 36 entries per elem
-        % Residual: 6 entries per elem
-        
         i_block = zeros(36 * count, 1);
         j_block = zeros(36 * count, 1);
         v_block = zeros(36 * count, 1);
@@ -95,83 +95,57 @@ function [K_tan, Res] = assemble_nonlinear_jacobian(Model, x, b_ext)
         % 单元循环
         % -------------------------------------------------
         for e = 1:count
-            % 几何信息
             nodes = loc_T(:, e);
             p_elem = loc_P_all(:, nodes);
             
-            % 当前单元解向量 (已修正符号)
             a_vec = loc_A(:, e);
             
-            % 计算 B 场 (B = Curl N * a)
-            % 使用 Kernel 生成的轻量函数
-            B_vec = calc_element_B(p_elem, a_vec); % 3x1
-            
+            % 计算 B 场
+            B_vec = calc_element_B(p_elem, a_vec); 
             B_sq = sum(B_vec.^2);
             
-            % 材料属性查询
+            % [修复] 使用本地材料库副本
             mat_id = loc_MatIDs(e);
-            mat_info = MatLib(mat_id);
+            mat_info = loc_MatLib(mat_id);
             
             [nu, dnu] = eval_material_nu(B_sq, mat_info);
             
-            % ---------------------------------------------
-            % 1. 计算残差贡献 (Internal Force)
+            % --- 1. 计算残差 (Internal Force) ---
             % F_int = K_secant(nu) * a
-            % ---------------------------------------------
-            
-            % 调用各向同性内核计算 K_sec
             Ke_sec = Ke_curl_curl(p_elem, nu);
-            
             f_local = Ke_sec * a_vec;
             
-            % 符号修正 (仅用于组装回全局)
             s = loc_Signs(:, e);
             f_corrected = f_local .* s;
             
-            % 存入 Buffer
             range_vec = ptr_vec+1 : ptr_vec+6;
             f_idx_block(range_vec) = loc_T2E(:, e);
             f_val_block(range_vec) = f_corrected;
             ptr_vec = ptr_vec + 6;
             
-            % ---------------------------------------------
-            % 2. 计算雅可比贡献 (Tangent Stiffness)
-            % J = K_aniso(nu_tensor)
-            % ---------------------------------------------
-            
+            % --- 2. 计算雅可比 (Tangent Stiffness) ---
             if dnu == 0
-                % 线性情况: Jacobian = Secant Stiffness
                 Ke_tan = Ke_sec;
             else
-                % 非线性情况: 构造微分磁阻率张量
-                % nu_diff = nu*I + 2*dnu * B*B'
-                % 注意: B*B' 是 3x3 矩阵
-                
-                % 手动构建 B*B' 以加速
                 bx = B_vec(1); by = B_vec(2); bz = B_vec(3);
                 BBt = [bx*bx, bx*by, bx*bz;
                        bx*by, by*by, by*bz;
                        bx*bz, by*bz, bz*bz];
                    
+                % 微分磁阻率张量
+                % nu_diff = nu*I + 2*dnu * B*B'
                 Nu_tensor = nu * eye(3) + (2 * dnu) * BBt;
                 
-                % 提取唯一的对称分量输入给 Kernel
-                % [xx, xy, xz, yy, yz, zz]
                 nu_vec = [Nu_tensor(1,1), Nu_tensor(1,2), Nu_tensor(1,3), ...
                           Nu_tensor(2,2), Nu_tensor(2,3), Nu_tensor(3,3)];
                 
-                % 调用各向异性内核
                 Ke_tan = Ke_aniso(p_elem, nu_vec);
             end
             
-            % 符号修正 (行和列)
-            % K_corrected = K .* (s * s')
+            % 符号修正 K_corrected = K .* (s * s')
             Ke_tan_corr = Ke_tan .* (s * s');
             
-            % 存入 Buffer (Matrix)
             row_indices = loc_T2E(:, e);
-            
-            % 快速展开索引
             R_idx = repmat(row_indices, 1, 6);
             C_idx = repmat(row_indices', 6, 1);
             
@@ -192,23 +166,16 @@ function [K_tan, Res] = assemble_nonlinear_jacobian(Model, x, b_ext)
     
     % 3. 全局组装 (Reduce)
     % ----------------------------------------------------
-    % Jacobian Matrix
     I = vertcat(I_cell{:});
     J = vertcat(J_cell{:});
     V = vertcat(V_cell{:});
     K_tan = sparse(I, J, V, numEdges, numEdges);
     
-    % Internal Force Vector
     idx_F = vertcat(idx_F_cell{:});
     val_F = vertcat(F_int_cell{:});
-    F_int = sparse(idx_F, 1, val_F, numEdges, 1); % sparse 自动累加
-    % 转为全向量 (如果维度不大) 或者保持 sparse
+    F_int = sparse(idx_F, 1, val_F, numEdges, 1);
     F_int = full(F_int);
     
     % 4. 计算残差 Res = F_int - F_ext
-    % ----------------------------------------------------
     Res = F_int - b_ext;
-    
-    % t_end = toc(t_start);
-    % fprintf('  [Assembly] Done in %.4f s. Res Norm: %.4e\n', t_end, norm(Res));
 end

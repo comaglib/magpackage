@@ -1,8 +1,7 @@
 function b = assemble_rhs_reduced(Model, CoilSegments)
-% ASSEMBLE_RHS_REDUCED 组装 A-V 表述下的右端载荷向量 (HPC修正版 v2)
-% 修复: 消除 parfor 中的所有广播变量警告
-% 物理修正: 使用 (nu0 - nu) * Bs 作为源项，正确模拟磁化效应。
-% HPC修正:  使用预分块 (Pre-chunking) 消除 parfor 广播开销。
+% ASSEMBLE_RHS_REDUCED 组装 A-V 表述下的右端载荷向量 (HPC修正版 v3)
+% 
+% 修正: 在 parfor 内部调用串行版 Biot-Savart，避免嵌套并行错误。
 
     fprintf('正在组装右端项 (RHS Reduced)...\n');
     t_start = tic;
@@ -24,7 +23,7 @@ function b = assemble_rhs_reduced(Model, CoilSegments)
         if mat_id > length(MatLib), continue; end
         
         mu_r = MatLib(mat_id).Mu_r;
-        if isempty(mu_r), mu_r = 1.0; end % 防御性编程
+        if isempty(mu_r), mu_r = 1.0; end
         
         if abs(mu_r - 1.0) > 1e-4
             IsMagnetic(i) = true;
@@ -41,12 +40,11 @@ function b = assemble_rhs_reduced(Model, CoilSegments)
         return;
     end
     
-    % 2. 严格的数据打包 (Chunking)
+    % 2. 数据打包
     chunkSize = 2000;
     numChunks = ceil(numTarget / chunkSize);
     ElementBlocks = cell(numChunks, 1);
     
-    % 提取原始数组 (避免在循环中引用 Mesh 结构体)
     T_raw = Mesh.T;
     T2E_raw = Mesh.T2E;
     Signs_raw = double(Mesh.T2E_Sign);
@@ -54,11 +52,8 @@ function b = assemble_rhs_reduced(Model, CoilSegments)
     for k = 1:numChunks
         s_idx = (k-1)*chunkSize + 1;
         e_idx = min(k*chunkSize, numTarget);
-        
-        % 获取当前块的全局单元索引
         g_idxs = target_elems(s_idx:e_idx);
         
-        % 只拷贝需要的数据片段到 Cell
         ElementBlocks{k}.T = T_raw(:, g_idxs);
         ElementBlocks{k}.T2E = T2E_raw(:, g_idxs);
         ElementBlocks{k}.Signs = Signs_raw(:, g_idxs);
@@ -68,13 +63,11 @@ function b = assemble_rhs_reduced(Model, CoilSegments)
     
     b_cell = cell(numChunks, 1);
     
-    % 广播常量
     C_P = parallel.pool.Constant(Mesh.P);
     C_Coil = parallel.pool.Constant(CoilSegments);
     
     parfor k = 1:numChunks
-        Block = ElementBlocks{k}; % 获取本地副本
-        
+        Block = ElementBlocks{k};
         count = Block.Count;
         local_T = Block.T;
         local_T2E = Block.T2E;
@@ -96,7 +89,8 @@ function b = assemble_rhs_reduced(Model, CoilSegments)
             Centers(:, e) = mean(pts, 2); 
         end
         
-        Bs_all = compute_biot_savart_B(local_Coil, Centers);
+        % [核心修正] 调用串行版 Biot-Savart
+        Bs_all = compute_biot_savart_B_serial(local_Coil, Centers);
         
         for e = 1:count
             nodes = local_T(:, e);
@@ -122,7 +116,6 @@ function b = assemble_rhs_reduced(Model, CoilSegments)
             
             Vol = abs(detJ) / 6.0;
             
-            % RHS = Vol * (Curl N)' * (nu0 - nu) * Bs
             M_contrast = (1/(4*pi*1e-7) - nu_val) * Bs;
             local_b = Vol * (Curl_N' * M_contrast);
             
@@ -138,7 +131,6 @@ function b = assemble_rhs_reduced(Model, CoilSegments)
     end
     
     b = sum([b_cell{:}], 2); 
-    
     t_end = toc(t_start);
     fprintf('右端项组装完成。耗时: %.4f 秒\n', t_end);
 end
