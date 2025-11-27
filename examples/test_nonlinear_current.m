@@ -102,28 +102,3 @@ function test_nonlinear_current()
         end
     end
 end
-
-function MeshRaw = create_test_mesh_direct(filename)
-    % (复用 Robust Mesh Generator)
-    fprintf('  [MeshGen] Generating mesh...\n');
-    [X1, Y1, Z1] = ndgrid(linspace(-0.15, 0.15, 5)); P_inner = [X1(:), Y1(:), Z1(:)];
-    [X2, Y2, Z2] = ndgrid(linspace(-0.6, 0.6, 7)); P_outer = [X2(:), Y2(:), Z2(:)];
-    P = unique([P_inner; P_outer], 'rows'); nNodes = size(P, 1);
-    DT = delaunayTriangulation(P); T = DT.ConnectivityList; 
-    p1=P(T(:,1),:); p2=P(T(:,2),:); p3=P(T(:,3),:); p4=P(T(:,4),:);
-    vols = sum(cross(p2-p1, p3-p1, 2) .* (p4-p1), 2);
-    neg_mask = vols < 0; if any(neg_mask), T(neg_mask, [1 2]) = T(neg_mask, [2 1]); end
-    P_io = P'; T_io = T'; nElems = size(T_io, 2);
-    Centers = (P(T(:,1),:)+P(T(:,2),:)+P(T(:,3),:)+P(T(:,4),:))/4;
-    in_iron = abs(Centers(:,1))<0.16 & abs(Centers(:,2))<0.16 & abs(Centers(:,3))<0.16;
-    ElemTags = ones(1, nElems); ElemTags(in_iron) = 2;
-    TR = triangulation(T, P); FB = freeBoundary(TR); 
-    MeshRaw.P = P_io; MeshRaw.T = T_io; MeshRaw.RegionTags = ElemTags;
-    MeshRaw.Faces = FB'; MeshRaw.FaceTags = repmat(100, 1, size(FB,1));
-    % Write file
-    fid=fopen(filename,'w'); fprintf(fid,'$MeshFormat\n4.1 0 8\n$EndMeshFormat\n$Nodes\n1 %d 1 %d\n2 1 0 %d\n',nNodes,nNodes,nNodes);
-    fprintf(fid,'%d %.6f %.6f %.6f\n',[(1:nNodes);P_io]); fprintf(fid,'$EndNodes\n$Elements\n1 %d 1 %d\n',size(FB,1)+nElems,size(FB,1)+nElems);
-    fprintf(fid,'2 100 2 %d\n%d %d %d %d\n',size(FB,1),[(1:size(FB,1));FB']);
-    fprintf(fid,'3 1 4 %d\n%d %d %d %d %d\n',nElems,[(size(FB,1)+1:size(FB,1)+nElems);T_io]);
-    fprintf(fid,'$EndElements\n'); fclose(fid);
-end
