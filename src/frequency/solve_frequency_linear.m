@@ -1,93 +1,82 @@
 function [Solution, Info] = solve_frequency_linear(Model, Coil, FreqParams)
-% SOLVE_FREQUENCY_LINEAR 线性时谐磁场求解器 (AC Magnetic, 修正版)
+% SOLVE_FREQUENCY_LINEAR [Final Fix: Direct Source]
 % 
-% 求解方程:
-% [ K + jw*M_sig + eps*M_reg    C_sig ] [ A ] = [ b_mag ]
-% [ jw * C_sig'                 jw*G  ] [ V ]   [ 0     ]
-%
-% 考虑了场路耦合的基础:
-% 1. 支持复数电流输入 (幅值+相位)
-% 2. 输出包含总复功率，便于后续计算阻抗 Z
-% 
-% 修复: 增加了感应源项 (-jw * M * As)，解决非磁性导体 RHS 为 0 的问题。
-% 修复: 增大了空气域正则化系数，防止低频下 A 场发散。
-
+% 修正:
+% 1. 移除电流缩放逻辑，直接使用 Coil 中的真实电流计算 RHS。
+% 2. 保持空气电导率正则化逻辑。
 
     fprintf('==============================================\n');
-    fprintf('   Linear Frequency Domain Solver (AC Magnetic)\n');
+    fprintf('   Linear Frequency Solver (Direct Source)    \n');
     fprintf('==============================================\n');
 
     freq = FreqParams.Frequency;
     omega = 2 * pi * freq;
-    fprintf('  - Frequency: %.2f Hz\n', freq);
 
     DofData = create_dof_map(Model);
     numEdges = DofData.NumEdges;
     numActiveV = DofData.NumActiveNodes;
     
-    % 1. 矩阵组装
     if isempty(gcp('nocreate')), try parpool('local'); catch; end; end
     
+    % 1. 组装矩阵
+    fprintf('  [Matrix] Assembling Stiffness (K)...\n');
     K = assemble_magnetic_stiffness(Model);
-    M_sigma = assemble_mass_matrix(Model, 'ConductorOnly');
+    
+    % 使用 'Physical' 模式，包含空气微小电导率以防奇异
+    fprintf('  [Matrix] Assembling Mass (M_sigma)...\n');
+    M_sigma = assemble_mass_matrix(Model, 'Physical'); 
+    
+    fprintf('  [Matrix] Assembling Laplacian (G) & Coupling (C)...\n');
     G_sigma = assemble_scalar_laplacian(Model, DofData);
     C_sigma = assemble_coupling_matrix(Model, 'Physical', DofData);
     
-    % [修正] 增强正则化: 1e-6
+    % A 场正则化
     M_reg = assemble_mass_matrix(Model, 'All');
     scale_K = mean(abs(nonzeros(K)));
-    eps_A = 1e-6 * scale_K; 
+    eps_A = 1e-8 * scale_K; 
     
-    % 2. 系统矩阵
-    fprintf('  [Freq] Building System Matrix...\n');
-    
+    % 2. 系统构建
     K_eff = K + 1i * omega * M_sigma + eps_A * M_reg;
-    C_eff = C_sigma;
-    Ct_eff = 1i * omega * C_sigma'; 
-    G_eff  = 1i * omega * G_sigma;
+    SysK = [K_eff, C_sigma; 1i * omega * C_sigma', 1i * omega * G_sigma];
     
-    SysK = [K_eff, C_eff; Ct_eff, G_eff];
+    % 3. 右端项
+    fprintf('  [RHS] Assembling Source Terms...\n');
     
-    % 3. 组装右端项
-    fprintf('  [Freq] Assembling Source...\n');
+    % [CRITICAL FIX] 直接投影带真实电流的 Coil
+    % 不再进行 CoilUnit * I_phasor 的操作，防止电流丢失
+    As_edges = project_source_A_on_edges(Model, Coil);
     
-    b_mag = assemble_rhs_reduced(Model, Coil);
+    % 检查源项强度
+    max_As = max(abs(As_edges));
+    fprintf('         源场投影强度检查: |As|_max = %.4e Weber\n', max_As);
+    if max_As < 1e-9
+        warning('检测到源场投影几乎为零！请检查线圈电流或几何位置。');
+    end
     
-    % 感应源
-    CoilUnit = Coil; CoilUnit.I(:) = 1.0;
-    As_unit = project_source_A_on_edges(Model, CoilUnit);
-    I_phasor = Coil.I(1); 
-    As_vec = As_unit * I_phasor;
+    % 感应源项: -jw * sigma * A_source
+    b_ind = -1i * omega * (M_sigma * As_edges);
     
-    b_ind = -1i * omega * (M_sigma * As_vec);
-    b_total = b_mag + b_ind;
+    % 磁化源项: TEAM 7 为非磁性，设为 0
+    b_mag = sparse(numEdges, 1);
     
-    SysRHS = [b_total; sparse(numActiveV, 1)];
+    SysRHS = [b_mag + b_ind; sparse(numActiveV, 1)];
     
     % 4. 边界条件
-    if isfield(Model, 'Runtime') && isfield(Model.Runtime, 'FixedEdges')
-        fixed_edges = Model.Runtime.FixedEdges;
-    else
-        fixed_edges = [];
-    end
-    fixed_vals = zeros(length(fixed_edges), 1);
-    
-    [SysK_bc, SysRHS_bc] = apply_dirichlet_bc(SysK, SysRHS, fixed_edges, fixed_vals);
+    if isfield(Model.Runtime, 'FixedEdges'), fe = Model.Runtime.FixedEdges; else, fe = []; end
+    [SysK, SysRHS] = apply_dirichlet_bc(SysK, SysRHS, fe, zeros(size(fe)));
     
     % 5. 求解
-    fprintf('  [Freq] Solving...\n');
+    fprintf('  [Solver] Solving Linear System (Size: %d)...\n', size(SysK, 1));
     Model.Solver.Linear.Interface = 'MUMPS'; 
     Model.Solver.Linear.Symmetric = true; 
-    if ~isfield(Model.Solver.Linear, 'MumpsICNTL')
-        Model.Solver.Linear.MumpsICNTL = struct();
-    end
-    Model.Solver.Linear.MumpsICNTL.i8 = 77;
     
-    x_sol = linear_solve(SysK_bc, SysRHS_bc, Model);
+    x = linear_solve(SysK, SysRHS, Model);
     
-    Solution.A = x_sol(1:numEdges);
-    Solution.V_active = x_sol(numEdges+1:end); 
+    Solution.A = x(1:numEdges);
+    Solution.V_active = x(numEdges+1:end); 
     
-    Info.SystemSize = length(x_sol);
+    Info.SystemSize = size(SysK, 1);
+    Info.DofData = DofData;
+    
     fprintf('  [Freq] Done. |A|_max = %.2e\n', max(abs(Solution.A)));
 end

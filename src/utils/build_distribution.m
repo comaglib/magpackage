@@ -3,7 +3,7 @@ function build_distribution()
 % 
 % 功能:
 % 1. 创建 build 目录
-% 2. 复制 src, data, docs, examples
+% 2. 复制 src, data, docs, examples, tutorials
 % 3. 清理临时文件 (.asv, .mex, etc.)
 % 4. 生成版本信息
 
@@ -32,6 +32,12 @@ function build_distribution()
     
     fprintf('  - Copying Examples...\n');
     copyfile('examples', fullfile(dist_name, 'examples'));
+
+    fprintf('  - Copying Tutorials...\n');
+    copyfile('tutorials', fullfile(dist_name, 'tutorials'));
+
+    fprintf('  - Copying Tests...\n');
+    copyfile('tests', fullfile(dist_name, 'tests'));
     
     % 3. 创建启动脚本
     fid = fopen(fullfile(dist_name, 'startup_fem.m'), 'w');
@@ -40,6 +46,8 @@ function build_distribution()
     fprintf(fid, 'addpath(genpath(''data''));\n');
     fprintf(fid, 'addpath(genpath(''docs''));\n');
     fprintf(fid, 'addpath(genpath(''examples''));\n');
+    fprintf(fid, 'addpath(genpath(''tutorials''));\n');
+    fprintf(fid, 'addpath(genpath(''tests''));\n');
     fprintf(fid, 'fprintf(''MAGPACKAGE Loaded.\\n'');\n');
     fclose(fid);
     
@@ -50,6 +58,8 @@ function build_distribution()
     fprintf(fid, 'rmpath(genpath(''data''));\n');
     fprintf(fid, 'rmpath(genpath(''docs''));\n');
     fprintf(fid, 'rmpath(genpath(''examples''));\n');
+    fprintf(fid, 'rmpath(genpath(''tutorials''));\n');
+    fprintf(fid, 'rmpath(genpath(''tests''));\n');
     fprintf(fid, 'fprintf(''MAGPACKAGE Cleaned.\\n'');\n');
     fclose(fid);
     
@@ -64,4 +74,10 @@ function build_distribution()
     end
     
     fprintf('  [Success] Build created in folder: %s\n', dist_name);
+    
+    % temp detele
+    rmdir("magpackage_v1.0_alpha/docs/",'s');
+    delete("magpackage_v1.0_alpha/src/3rdparty/mumps/*.mexa64");
+    delete("magpackage_v1.0_alpha/src/3rdparty/mumps/*.mexw64");
+    delete("magpackage_v1.0_alpha/src/3rdparty/mumps/*.dll");
 end
