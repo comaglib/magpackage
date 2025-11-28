@@ -1,11 +1,11 @@
 classdef PostProcessor < handle
-    % POSTPROCESSOR 有限元后处理模块 (v1.4 - Broadcast Optimized)
+    % POSTPROCESSOR 有限元后处理模块 (v2.1 - Final Robust Fix)
     % 
-    % 修复:
-    %   1. [Performance] 使用 parallel.pool.Constant 封装 P, T, A_sol 等大数组，
-    %      彻底解决 parfor 中的广播变量警告，显著降低内存开销。
-    %   2. [Robustness] 修正了 computeMagnitude 中的维度重塑逻辑。
-    %   3. [Safety] 保持了 numElems 的整数强制转换。
+    % 修复与功能整合:
+    %   1. [Critical] 修复 parfor 循环范围错误：显式将 numElems 转换为 double 整数。
+    %   2. [Optimization] 使用 parallel.pool.Constant 封装大数组，避免广播开销。
+    %   3. [Feature] 保留 computeCentroids 以支持 Visualizer。
+    %   4. [Math] computeMagnitude 支持复数场 (abs.^2)。
     
     properties
         Assembler
@@ -28,81 +28,71 @@ classdef PostProcessor < handle
             end
         end
         
+        function centers = computeCentroids(obj)
+            % COMPUTECENTROIDS 计算所有单元的几何重心 (用于可视化)
+            % 输出: centers [3 x NumElements]
+            P = obj.Mesh.P;
+            T = obj.Mesh.T;
+            % 向量化计算
+            centers = (P(:, T(1,:)) + P(:, T(2,:)) + P(:, T(3,:)) + P(:, T(4,:))) / 4.0;
+        end
+        
         function B_elems = computeElementB(obj, A_sol, spaceName)
             % COMPUTEELEMENTB 计算所有单元重心的磁通密度 B
-            % 优化: 解决了 P 和 A_sol 的广播变量问题
+            % 支持并行计算和多列解向量(HBFEM)
             
             if nargin < 3
                 keys = obj.DofHandler.DofMaps.keys;
-                targetKey = '';
+                targetKey = keys{1}; 
                 for k = 1:length(keys)
-                    if contains(keys{k}, 'Nedelec')
-                        targetKey = keys{k}; break;
-                    end
+                    if contains(keys{k}, 'Nedelec'), targetKey = keys{k}; break; end
                 end
-                if isempty(targetKey), error('No Nedelec space found.'); end
                 dofMap = obj.DofHandler.DofMaps(targetKey);
             else
                 dofMap = obj.DofHandler.DofMaps(spaceName);
             end
             
-            % [Fix] 显式转换为标量 Double 整数
+            % [Critical Fix] 显式强制转换为标量 double 整数
+            % 解决 "parfor 循环变量范围 'e' 的端点计算结果必须为整数" 错误
             numElems = fix(full(double(obj.Mesh.NumElements)));
             
             numCols = size(A_sol, 2);
             B_elems = zeros(3, numElems, numCols);
             
-            % [Optimization] 将大数组放入 Constant Pool，避免广播
+            % [Optimization] 使用 Constant 避免广播
             C_P = parallel.pool.Constant(obj.Mesh.P);
             C_T = parallel.pool.Constant(obj.Mesh.T);
             C_Signs = parallel.pool.Constant(double(obj.Mesh.T2E_Sign));
             C_Sol = parallel.pool.Constant(A_sol);
             C_DofMap = parallel.pool.Constant(dofMap);
             
-            % 预计算基函数 (P1 Nedelec Curl 在单元内为常数)
             q_center = [0.25; 0.25; 0.25];
             [~, curl_ref] = nedelec_tet_p1(q_center); 
             C_ref = reshape(curl_ref, 6, 3);
             
             parfor e = 1:numElems
-                % 获取本地引用 (Worker 端零拷贝访问)
-                loc_P = C_P.Value;
-                loc_T = C_T.Value;
-                loc_Signs = C_Signs.Value;
-                loc_Sol = C_Sol.Value;
-                loc_DofMap = C_DofMap.Value;
+                % 获取 Worker 本地数据副本
+                loc_P = C_P.Value; loc_T = C_T.Value; loc_Signs = C_Signs.Value;
+                loc_Sol = C_Sol.Value; loc_DofMap = C_DofMap.Value;
                 
-                % 1. 几何计算 (此时 loc_P 的索引访问不再触发广播警告)
                 nodes = loc_T(:, e);
                 p_elem = loc_P(:, nodes); 
                 
                 [J_mat, detJ] = compute_jacobian_tet(p_elem);
                 invDetJ = 1.0 / detJ;
-                
-                % 2. Piola 变换: Curl_phy = (1/detJ) * J * Curl_ref
                 C_phy = (C_ref * J_mat') * invDetJ;
                 
-                % 3. 获取系数
                 dofs = loc_DofMap(:, e);
                 s = loc_Signs(:, e);
-                
-                % A_local_all: [6 x K]
                 A_local_all = loc_Sol(dofs, :) .* s;
                 
-                % 4. 计算 B = Curl * A
                 B_val = C_phy' * A_local_all;
-                
-                % 5. 存入切片
                 B_elems(:, e, :) = B_val;
             end
         end
         
         function [B_val, elem_idx] = probeB(obj, A_sol, point)
-            % PROBEB 在指定空间点探测 B 场
-            if isempty(obj.Triangulation)
-                error('Triangulation not initialized.');
-            end
-            
+            if isempty(obj.Triangulation), error('Triangulation not initialized.'); end
             elem_idx = pointLocation(obj.Triangulation, point(:)');
             
             if isnan(elem_idx)
@@ -113,10 +103,8 @@ classdef PostProcessor < handle
             
             keys = obj.DofHandler.DofMaps.keys;
             dofMap = obj.DofHandler.DofMaps(keys{1});
-            
             nodes = obj.Mesh.T(:, elem_idx);
             p_elem = obj.Mesh.P(:, nodes);
-            
             [J_mat, detJ] = compute_jacobian_tet(p_elem);
             invDetJ = 1.0 / detJ;
             
@@ -127,19 +115,14 @@ classdef PostProcessor < handle
             
             dofs = dofMap(:, elem_idx);
             s = double(obj.Mesh.T2E_Sign(:, elem_idx));
-            
             A_local = A_sol(dofs, :) .* s;
             B_val = C_phy' * A_local;
         end
         
         function mag = computeMagnitude(obj, VectorField)
-            % 计算向量场模值 B_mag [Ne x K]
-            % VectorField 输入维度: [3 x Ne x K]
-            
-            mag_sq = sum(VectorField.^2, 1);
+            % [Fix] 支持复数场 (abs.^2)
+            mag_sq = sum(abs(VectorField).^2, 1);
             mag = sqrt(mag_sq);
-            
-            % [Fix] 健壮的 reshape 逻辑
             [~, Ne, K] = size(VectorField);
             mag = reshape(mag, Ne, K);
         end

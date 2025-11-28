@@ -74,7 +74,7 @@ fprintf('         Steps: %d, dt: %.2e s\n', N_steps, dt);
 
 % --- 6. 执行求解 ---
 fprintf('[Step 5] Running Solver...\n');
-[Solution, Info] = solve_transient_nonlinear(assembler, TimeParams, MatLibData, space);
+[Solution, Info] = TransientNonlinearSolver(assembler, TimeParams, MatLibData, space);
 
 % --- 7. 后处理与验证 ---
 fprintf('[Step 6] Analyzing Results...\n');

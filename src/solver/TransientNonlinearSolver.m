@@ -1,4 +1,4 @@
-function [Solution, Info] = solve_transient_nonlinear(Assembler, TimeParams, MatLibData, Space)
+function [Solution, Info] = TransientNonlinearSolver(Assembler, TimeParams, MatLibData, Space)
 % SOLVE_TRANSIENT_NONLINEAR 非线性瞬态求解器 (v3.2 - Robust)
 % 
 % 求解方程: Curl(Nu * Curl A) + Sigma * dA/dt = J

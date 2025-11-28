@@ -10,18 +10,15 @@ fprintf('=========================================================\n');
 fprintf('[Step 1] Generating Mesh (5x5x5)...\n');
 [X, Y, Z] = meshgrid(linspace(0,1,5), linspace(0,1,5), linspace(0,1,5));
 DT = delaunayTriangulation(X(:), Y(:), Z(:));
+
 mesh = Mesh();
 mesh.P = DT.Points';
 mesh.T = DT.ConnectivityList';
 mesh.RegionTags = ones(1, size(mesh.T, 2)); 
 
-% [Critical Fix] 手动更新网格统计信息
-% 必须在 generateEdges() 之前设置，因为拓扑构建依赖 NumElements
+% [Critical Fix] 显式更新网格统计信息 (防止 PostProcessor 报错)
 mesh.NumNodes = size(mesh.P, 2);
 mesh.NumElements = size(mesh.T, 2);
-
-% (可选) 如果其他模块需要 Faces，可在此处生成，但目前求解器核心不需要
-% mesh.Faces = ... 
 
 mesh.generateEdges();
 
@@ -68,13 +65,22 @@ solver.LinearSolver.Method = 'Auto';
 solver.LinearSolver.MumpsICNTL.i14 = 60; 
 
 % HBFEM 收敛参数
-solver.Tolerance = 1e-3;
+solver.Tolerance = 1e-4;
+
+% 正则化设置
+M = assembler.assembleMass(space);
+temp_MatMap = 1/mu0;
+K_lin = assembler.assembleStiffness(space, temp_MatMap);
+ref_val = full(mean(abs(diag(K_lin)))); % [Fix] Ensure full double
+
+% 弱正则化防止奇异
+solver.MatrixK_Add = ref_val * 1e-6 * M; 
 
 % --- 6. 负载步进求解 (Load Ramping) ---
 fprintf('[Step 5] Running HBFEM Solver with Ramping...\n');
 
 Target_J = 2e5; 
-NumSteps = 2; 
+NumSteps = 1; 
 x_curr = zeros(numDofs, aft.NumHarmonics); 
 
 idx_fund = find(harmonics == 1);
@@ -107,7 +113,7 @@ post = PostProcessor(assembler);
 % (A) 探测中心点场值
 center_point = [0.5, 0.5, 0.5];
 [B_center_harm, elem_idx] = post.probeB(X_sol, center_point);
-Bz_center = abs(B_center_harm(3, :)); % 取 Z 分量模值
+Bz_center = abs(B_center_harm(3, :)); 
 
 fprintf('\n--- Harmonic Analysis at Center (Element %d) ---\n', elem_idx);
 fprintf(' Order |  Bz Amplitude (T)  | Ratio to Fund. (%%) \n');
@@ -122,16 +128,13 @@ for k = 1:aft.NumHarmonics
     fprintf('   %d   |     %8.4f       |     %6.2f %% \n', h, mag, ratio);
 end
 
-% (B) 计算全场 B 并统计最大值
-fprintf('\n[Full Field Statistics]\n');
-% 这里的 computeElementB 内部 parfor 现在应该能正常工作了，因为 NumElements 已赋值
+% (B) 计算全场 B
 B_all = post.computeElementB(X_sol); 
-B_mag_all = post.computeMagnitude(B_all); % [Ne x K]
+B_mag_all = post.computeMagnitude(B_all); 
 
 max_B_fund = max(B_mag_all(:, idx_fund));
-fprintf('  - Max Fundamental B: %.4f T\n', max_B_fund);
+fprintf('\n  - Max Fundamental B: %.4f T\n', max_B_fund);
 
-% 验证非线性效应
 idx_3rd = find(harmonics == 3);
 mag_3rd = Bz_center(idx_3rd);
 
