@@ -1,5 +1,6 @@
 classdef Assembler < handle
-    % ASSEMBLER 有限元组装器 (v5.0 - Winding Support)
+    % ASSEMBLER 有限元组装器 (v5.1 - Public Interface)
+    % 更新: 公开了 preparePackedData 供 PostProcessor 使用
     
     properties
         Mesh
@@ -24,7 +25,7 @@ classdef Assembler < handle
             try
                 Nu_vec = materialMap(elemTags);
             catch
-                error('MaterialMap Error (Stiffness).');
+                error('MaterialMap Error.');
             end
             packedData.Nu = Nu_vec(:);
             
@@ -71,58 +72,16 @@ classdef Assembler < handle
         end
         
         function C = assembleWinding(obj, space, windingObj)
-            % ASSEMBLEWINDING 组装绕组耦合向量 C
-            % packedData = obj.preparePackedData(space);
-            % packedData.RegionTags = obj.Mesh.RegionTags;
-            % 为了减少重复代码，直接调用 preparePackedData
-            
             packedData = obj.preparePackedData(space);
             packedData.RegionTags = obj.Mesh.RegionTags;
-            
             C = assemble_winding_kernel(packedData, windingObj, obj.Config);
         end
         
-        function S = assembleScalarStiffness(obj, space, coeffMap)
-            % ASSEMBLESCALARSTIFFNESS 组装标量拉普拉斯矩阵
-            % S_ij = Integral( sigma * grad(Ni) . grad(Nj) )
-            
-            % fprintf('[Assembler] Assembling Scalar Laplacian...\n');
-            packedData = obj.preparePackedData(space);
-            
-            % 处理系数 (如电导率 sigma)
-            if nargin > 2 && ~isempty(coeffMap)
-                elemTags = obj.Mesh.RegionTags;
-                try
-                    Coeff_vec = coeffMap(elemTags);
-                catch
-                    error('MaterialMap Error (Scalar Stiffness).');
-                end
-                packedData.Coeff = Coeff_vec(:);
-            end
-            
-            if strcmpi(space.Type, 'Lagrange')
-                [I, J, V] = assemble_scalar_laplacian_kernel(packedData, obj.Config);
-                
-                numDofs = obj.DofHandler.NumGlobalDofs;
-                % 这里的 NumGlobalDofs 必须是 Lagrange 空间的 DoF 数
-                % 如果 DofHandler 混用了 Edge 和 Node，需要小心
-                % 目前 DofHandler 的设计是一个 Space 对应一套 DoF，NumGlobalDofs 是最后一次分配的值
-                % 为了安全，最好从 DofMap 重新获取最大值，或者 DofHandler 支持多空间管理
-                
-                % 临时修正: 获取当前 space 的最大 DoF
-                dofMap = obj.DofHandler.DofMaps(space.toString());
-                currentNumDofs = max(dofMap(:));
-                
-                S = sparse(I, J, V, currentNumDofs, currentNumDofs);
-            else
-                error('Scalar stiffness requires Lagrange space.');
-            end
-        end
-
         function [J_mat, R_mat] = assembleJacobian(obj, space, solutionA, matLibData, calcJ)
             if nargin < 5, calcJ = true; end
             packedData = obj.preparePackedData(space);
             packedData.RegionTags = obj.Mesh.RegionTags;
+            
             if strcmpi(space.Type, 'Nedelec')
                 [I, J, V, R_vec] = assemble_jacobian_kernel(packedData, solutionA, matLibData, obj.Config, calcJ);
                 if calcJ
@@ -140,6 +99,7 @@ classdef Assembler < handle
             if nargin < 6, calcJ = true; end
             packedData = obj.preparePackedData(space);
             packedData.RegionTags = obj.Mesh.RegionTags;
+            
             if strcmpi(space.Type, 'Nedelec')
                 [I, J, V, R_mat] = assemble_hbfem_kernel(packedData, solHarmonics, aftObj, matLibData, obj.Config, calcJ);
                 if calcJ
@@ -152,9 +112,7 @@ classdef Assembler < handle
                 error('Unsupported space.');
             end
         end
-    end
-    
-    methods (Access = private)
+        
         function packedData = preparePackedData(obj, space)
             packedData = obj.DofHandler.packForKernel(space);
             packedData.P = obj.Mesh.P;
