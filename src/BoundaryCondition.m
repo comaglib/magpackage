@@ -1,47 +1,33 @@
 classdef BoundaryCondition < handle
-    % BOUNDARYCONDITION 边界条件处理工具 (修正版 v2)
+    % BOUNDARYCONDITION 边界条件处理工具 (v2.1 - MRHS Support)
     %
-    % 修复:
-    % 1. [Critical] 边界识别算法从 "Edge-based" 改为 "Face-based"。
-    %    旧算法错误地假设边界棱只属于1个单元，导致漏掉绝大多数边界，引发矩阵奇异。
-    %    新算法正确识别属于边界面的所有棱。
+    % 更新:
+    %   1. applyDirichlet 现在支持矩阵形式的 F [Ndofs x Nrhs]。
+    %      这对参数提取和并行激励非常重要。
     
     methods (Static)
         function is_bnd_dof = findOuterBoundaryDofs(mesh, dofHandler, space)
             % FINDOUTERBOUNDARYDOFS 识别外边界上的自由度 (PEC)
-            % 逻辑:
-            % 1. 找到只出现一次的面 (Boundary Faces)。
-            % 2. 提取这些面上的所有棱 (Boundary Edges)。
-            % 3. 将这些棱映射回全局 Edge ID。
+            % 逻辑: 基于面拓扑 (Face Topology)
             
             fprintf('[BC] Detecting boundary edges using Face Topology...\n');
             
-            T = mesh.T; % [4 x Ne]
-            num_elems = size(T, 2);
-            
-            % 1. 构建所有面 (每个四面体4个面)
-            % Faces: [n1, n2, n3]
+            T = mesh.T; 
+            % 1. 构建所有面
             F1 = T([1 2 3], :);
             F2 = T([1 2 4], :);
             F3 = T([1 3 4], :);
             F4 = T([2 3 4], :);
             
-            % 拼接所有面 [3 x 4*Ne]
             AllFaces = [F1, F2, F3, F4];
-            
-            % 2. 对面内的节点排序 (保证唯一性)
             AllFaces = sort(AllFaces, 1);
             
-            % 3. 统计面出现的次数
-            % 转置为 [N_faces x 3] 以便使用 unique('rows')
+            % 2. 统计面出现的次数
             [U, ~, IC] = unique(AllFaces', 'rows');
             counts = accumarray(IC, 1);
             
-            % 出现次数为 1 的面即为边界/表面
-            bnd_face_mask = (counts == 1);
-            BndFaces = U(bnd_face_mask, :); % [N_bnd_faces x 3]
-            
-            fprintf('     - Found %d boundary faces.\n', size(BndFaces, 1));
+            % 3. 提取边界上的棱
+            BndFaces = U(counts == 1, :); 
             
             if isempty(BndFaces)
                 warning('No boundary faces detected! Check mesh connectivity.');
@@ -49,28 +35,17 @@ classdef BoundaryCondition < handle
                 return;
             end
             
-            % 4. 提取边界上的棱
-            % 每个三角形面有3条边: (1-2), (1-3), (2-3)
-            % BndFaces 已经是排序过的 [n1 < n2 < n3]
             E1 = BndFaces(:, [1 2]);
             E2 = BndFaces(:, [1 3]);
             E3 = BndFaces(:, [2 3]);
             
-            % 拼接并去重
-            BndEdgesRaw = [E1; E2; E3];
-            BndEdgesRaw = unique(BndEdgesRaw, 'rows'); % [N_bnd_edges x 2]
+            BndEdgesRaw = unique([E1; E2; E3], 'rows');
             
-            % 5. 映射回全局 Edge ID (DoF)
-            % mesh.Edges 是 [2 x N_global_edges] (已排序)
-            % 我们需要找到 mesh.Edges 中哪些列出现在 BndEdgesRaw 中
-            
-            GlobalEdges = mesh.Edges'; % [N_global x 2]
-            
-            % 使用 ismember 进行行匹配
+            % 4. 映射回全局 Edge ID
+            GlobalEdges = mesh.Edges';
             is_bnd_dof = ismember(GlobalEdges, BndEdgesRaw, 'rows');
             
-            % 6. 对齐输出维度
-            % 如果由 DofHandler 管理的 DoF 比 Edge 多 (例如未来引入 Node DoF)，需要补零
+            % 5. 对齐维度
             if length(is_bnd_dof) < dofHandler.NumGlobalDofs
                 padding = false(dofHandler.NumGlobalDofs - length(is_bnd_dof), 1);
                 is_bnd_dof = [is_bnd_dof; padding];
@@ -80,9 +55,14 @@ classdef BoundaryCondition < handle
         end
         
         function [K_sys, F_sys] = applyDirichlet(K, F, is_fixed)
-            % APPLYDIRICHLET 施加齐次 Dirichlet 边界条件 (Masking Method)
+            % APPLYDIRICHLET 施加 Dirichlet 边界条件
+            % 
+            % 输入:
+            %   K - 刚度矩阵
+            %   F - 载荷向量 或 载荷矩阵 [Ndofs x Nrhs]
+            %   is_fixed - 固定自由度的逻辑掩码
             
-            num_dofs = length(F);
+            num_dofs = size(K, 1);
             
             if ~islogical(is_fixed)
                 idx = is_fixed;
@@ -90,21 +70,27 @@ classdef BoundaryCondition < handle
                 is_fixed(idx) = true;
             end
             
-            % 构建自由度掩码矩阵 M
+            % 1. 处理刚度矩阵 K (置1法: K_free = M*K*M + I_fixed)
             is_free = ~is_fixed;
             M_free = spdiags(double(is_free), 0, num_dofs, num_dofs);
-            
-            % 矩阵投影: K_sys = M*K*M + I_fixed
             K_sys = M_free * K * M_free;
             
             M_fixed = spdiags(double(is_fixed), 0, num_dofs, num_dofs);
             K_sys = K_sys + M_fixed;
             
-            % 处理 RHS
+            % 2. 处理载荷 F
+            % 如果 F 是矩阵，需要将所有列中对应固定行的值置零
             F_sys = F;
-            F_sys(is_fixed) = 0;
             
-            fprintf('[BC] Applied Dirichlet BCs to %d DoFs.\n', sum(is_fixed));
+            if isvector(F)
+                % 单向量情况
+                F_sys(is_fixed) = 0;
+            else
+                % [Updated] 多向量情况 (MRHS)
+                F_sys(is_fixed, :) = 0;
+            end
+            
+            % fprintf('[BC] Applied Dirichlet BCs to %d DoFs.\n', sum(is_fixed));
         end
     end
 end
