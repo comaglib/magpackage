@@ -144,6 +144,26 @@ classdef Visualizer < handle
             axis equal vis3d; grid on; box on; view(3);
         end
         
+        function plotVectorField(obj, A_sol, points)
+            % PLOTVECTORFIELD 绘制矢量场
+            N = size(points, 1);
+            B_vals = zeros(N, 3);
+            
+            for i = 1:N
+                val = obj.PostProcessor.probeB(A_sol, points(i,:));
+                B_vals(i,:) = real(val'); 
+            end
+            
+            quiver3(points(:,1), points(:,2), points(:,3), ...
+                    B_vals(:,1), B_vals(:,2), B_vals(:,3), 1.5);
+            axis equal; grid on;
+            axis vis3d;
+            
+            xlabel('X'); ylabel('Y'); zlabel('Z');
+            title('Magnetic Flux Density B (Vectors)');
+            view(3);
+        end
+        
         function plotSliceSmoothed(obj, A_sol, normal, offset, gridDensity)
             % (保持原有代码不变)
             if nargin < 5, gridDensity = 100; end

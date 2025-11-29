@@ -110,12 +110,14 @@ end
 
 % === 功能 1: 网格可视化 ===
 fprintf('[Demo 1] Visualizing Mesh (Outer Surface)...\n');
+figure; subplot(2,2,1);
 viz.plotMesh('Alpha', 0.6, 'FaceColor', [0.8, 0.8, 0.8]);
 title('Mesh Outer Surface');
 drawnow;
 
 % === 功能 2: 矢量场绘制 ===
 fprintf('[Demo 2] Visualizing Vector Field...\n');
+subplot(2,2,2);
 pts_random = rand(50, 3) .* [0.8, 0.8, 0.4] + [0.1, 0.1, 0.05]; 
 viz.plotVectorField(A_sol, pts_random);
 title('Magnetic Flux Density B (Corrected)');
@@ -123,6 +125,7 @@ drawnow;
 
 % === 功能 3: 平滑切片云图 ===
 fprintf('[Demo 3] Visualizing Smoothed Slice...\n');
+subplot(2,2,3);
 viz.plotSliceSmoothed(A_sol, 'z', 0.25, 100); 
 title('Smoothed |B| Slice at Z=0.25m');
 clim([0.95, 1.05]); % 聚焦颜色范围
@@ -130,6 +133,7 @@ drawnow;
 
 % === 功能 4: 沿线数据提取 ===
 fprintf('[Demo 4] Probing Data along Line...\n');
+subplot(2,2,4);
 % 避免正好落在网格线上的采样点 (加 eps)
 startPt = [0, 0.5 + 1e-6, 0.25 + 1e-6];
 endPt   = [1, 0.5 + 1e-6, 0.25 + 1e-6];
@@ -137,7 +141,6 @@ N_samples = 100;
 
 data_B = post.probeLine(A_sol, startPt, endPt, N_samples, 'B');
 
-figure('Name', 'Line Probe Results');
 dist_axis = linspace(0, 1, N_samples);
 % 绘制 Bz
 plot(dist_axis, data_B(:,3), 'b.-', 'LineWidth', 1.0, 'DisplayName', 'FEM Bz');
