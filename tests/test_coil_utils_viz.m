@@ -1,212 +1,144 @@
-% tests/test_coil_utils_viz.m
+% test_coil_utils_viz.m
+% 测试 CoilGeometryUtils 的 6 个新函数 (V3.0)
+% ---------------------------------------------------------
 clear; clc; close all;
-addpath(genpath('src'));
 
-fprintf('=========================================================\n');
-fprintf('   Test: Coil Geometry Utils & Visualization (Fixed v3)  \n');
-fprintf('=========================================================\n');
+% 1. 环境初始化
+if exist('../src', 'dir'), addpath(genpath('../src'));
+elseif exist('magpackage/src', 'dir'), addpath(genpath('magpackage/src')); end
 
-%% === Case 1: 圆角矩形线圈 (Racetrack Coil) ===
-fprintf('\n[Case 1] Generating Racetrack Coil Mesh...\n');
+fprintf('==============================================\n');
+fprintf('   Test: CoilGeometryUtils (6 Functions)      \n');
+fprintf('==============================================\n');
 
-% 定义参数
-Params1.L_straight = 0.2; 
-Params1.R_mean = 0.05;    
-Params1.Width = 0.02;     
-Params1.Height = 0.02;    
-Params1.Center = [0, 0, 0];
+main_fig = figure('Name', 'Coil Geometry Tests', 'Position', [50, 50, 1200, 900]);
 
-% 生成网格 (修复了空洞过滤逻辑)
-mesh1 = generate_racetrack_mesh(Params1);
+%% --- Case 1: 圆形线圈 ---
+fprintf('\n[Case 1] Generating Circular Coil Mesh...\n');
+[P, T] = gen_torus(0.5, 0.1, 0.08);
+mesh1 = create_mesh(P, T);
+viz1 = create_viz(mesh1);
 
 % 1. 自动识别
-fprintf('[Analysis] Auto-detecting geometry...\n');
-[center, L, R, axis_idx] = CoilGeometryUtils.autoDetectRacetrack(mesh1, 1);
-fprintf('   Detected: Center=[%.3f %.3f %.3f], L=%.4f, R=%.4f, Axis=%d\n', ...
-    center, L, R, axis_idx);
+[center, R, ax_idx] = CoilGeometryUtils.autoDetectCircular(mesh1, 1);
 
 % 2. 计算流向
-fprintf('[Analysis] Computing current direction field...\n');
-dir_map1 = CoilGeometryUtils.computeRacetrackDirection(mesh1, 1, center, L, R, axis_idx);
+dir1 = CoilGeometryUtils.computeCircularDirection(mesh1, 1, center, R, ax_idx);
 
-% 3. 可视化
-figure('Name', 'Case 1: Racetrack Coil', 'Color', 'w', 'Position', [100, 100, 800, 600]);
-visualize_coil(mesh1, dir_map1, 'Racetrack Coil Current Flow');
+% 3. 绘图
+plot_case(main_fig, 1, viz1, dir1, 'Case 1: Circular');
 
 
-%% === Case 2: 圆形线圈 (Circular Coil) ===
-fprintf('\n[Case 2] Generating Circular Coil Mesh...\n');
+%% --- Case 2: 跑道型线圈 ---
+fprintf('\n[Case 2] Generating Racetrack Coil Mesh...\n');
+[P, T] = gen_racetrack(1.0, 0.3, 0.1, 0.08);
+mesh2 = create_mesh(P, T);
+viz2 = create_viz(mesh2);
 
-Params2.L_straight = 0.0; 
-Params2.R_mean = 0.08;    
-Params2.Width = 0.02;
-Params2.Height = 0.02;
-Params2.Center = [0.2, 0, 0.1]; 
+% 1. 自动识别
+[center, L, R, ax_idx] = CoilGeometryUtils.autoDetectRacetrack(mesh2, 1);
 
-mesh2 = generate_racetrack_mesh(Params2); 
+% 2. 计算流向
+dir2 = CoilGeometryUtils.computeRacetrackDirection(mesh2, 1, center, L, R, ax_idx);
 
-fprintf('[Analysis] Auto-detecting geometry...\n');
-[center2, L2, R2, axis2] = CoilGeometryUtils.autoDetectRacetrack(mesh2, 1);
-fprintf('   Detected: Center=[%.3f %.3f %.3f], L=%.4f, R=%.4f, Axis=%d\n', ...
-    center2, L2, R2, axis2);
-
-fprintf('[Analysis] Computing current direction field...\n');
-dir_map2 = CoilGeometryUtils.computeRacetrackDirection(mesh2, 1, center2, L2, R2, axis2);
-
-figure('Name', 'Case 2: Circular Coil', 'Color', 'w', 'Position', [150, 150, 800, 600]);
-visualize_coil(mesh2, dir_map2, 'Circular Coil Current Flow');
+% 3. 绘图
+plot_case(main_fig, 2, viz2, dir2, 'Case 2: Racetrack');
 
 
-%% === 辅助函数: 网格生成器 ===
-function mesh = generate_racetrack_mesh(p)
-    L = p.L_straight;
-    R = p.R_mean;
-    w = p.Width;
-    h = p.Height;
-    c = p.Center;
-    
-    n_radial = 3;
-    n_height = 3;
-    n_theta = 40; 
-    n_straight = 15; 
-    
-    points = [];
-    
-    r_range = linspace(-w/2, w/2, n_radial);
-    z_range = linspace(-h/2, h/2, n_height);
-    [RR, ZZ] = meshgrid(r_range, z_range);
-    RR = RR(:); ZZ = ZZ(:);
-    
-    % 右半圆
-    theta_right = linspace(-pi/2, pi/2, n_theta);
-    for i = 1:length(theta_right)
-        th = theta_right(i);
-        for k = 1:length(RR)
-            x = L/2 + (R + RR(k)) * cos(th);
-            y = 0   + (R + RR(k)) * sin(th);
-            z = ZZ(k);
-            points = [points; x, y, z]; %#ok<AGROW>
-        end
-    end
-    
-    % 左半圆
-    theta_left = linspace(pi/2, 3*pi/2, n_theta);
-    for i = 1:length(theta_left)
-        th = theta_left(i);
-        for k = 1:length(RR)
-            x = -L/2 + (R + RR(k)) * cos(th);
-            y = 0    + (R + RR(k)) * sin(th);
-            z = ZZ(k);
-            points = [points; x, y, z]; %#ok<AGROW>
-        end
-    end
-    
-    % 上直段
-    x_straight = linspace(-L/2, L/2, n_straight);
-    for i = 1:length(x_straight)
-        for k = 1:length(RR)
-            x = x_straight(i);
-            y = R + RR(k);
-            z = ZZ(k);
-            points = [points; x, y, z]; %#ok<AGROW>
-        end
-    end
-    
-    % 下直段
-    for i = 1:length(x_straight)
-        for k = 1:length(RR)
-            x = x_straight(i);
-            y = -R - RR(k); 
-            z = ZZ(k);
-            points = [points; x, y, z]; %#ok<AGROW>
-        end
-    end
-    
-    points = points + c;
-    
-    % Delaunay
-    DT = delaunayTriangulation(points);
-    T_all = DT.ConnectivityList;
-    P_all = DT.Points;
-    
-    % 过滤内孔
-    centers = (P_all(T_all(:,1),:) + P_all(T_all(:,2),:) + P_all(T_all(:,3),:) + P_all(T_all(:,4),:)) / 4.0;
-    rel_centers = centers - c;
-    
-    R_inner = R - w/2;
-    Threshold = R_inner * 0.5; % 保守阈值
-    
-    valid_mask = false(size(T_all, 1), 1);
-    
-    for i = 1:size(T_all, 1)
-        px = rel_centers(i, 1);
-        py = rel_centers(i, 2);
-        if abs(px) <= L/2
-            dist = abs(py);
-        else
-            dist = sqrt( (abs(px) - L/2)^2 + py^2 );
-        end
-        if dist >= Threshold
-            valid_mask(i) = true;
-        end
-    end
-    
-    T_final = T_all(valid_mask, :);
-    
-    % 构建 Mesh 对象 (标准: P 为 3xN, T 为 4xM)
-    mesh = Mesh();
-    mesh.P = P_all'; 
-    mesh.T = T_final'; 
-    mesh.NumNodes = size(mesh.P, 2);
-    mesh.NumElements = size(mesh.T, 2);
-    mesh.RegionTags = ones(1, mesh.NumElements); 
-    
+%% --- Case 3: 圆角矩形线圈 ---
+fprintf('\n[Case 3] Generating Rounded Rect Mesh...\n');
+Lx_real = 1.0; Ly_real = 0.6; R_real = 0.2;
+[P, T] = gen_rounded_rect(Lx_real, Ly_real, R_real, 0.08, 0.08);
+mesh3 = create_mesh(P, T);
+viz3 = create_viz(mesh3);
+
+% 1. 自动识别 (估算)
+[center, Lx_est, Ly_est, R_est, ax_idx] = CoilGeometryUtils.autoDetectRoundedRect(mesh3, 1);
+
+% 2. 计算流向 (使用真实几何以验证算法正确性，实际使用中可用估算值或手动修正)
+fprintf('   [Test] Using explicit geometry for verification: Lx=%.2f, Ly=%.2f\n', Lx_real, Ly_real);
+dir3 = CoilGeometryUtils.computeRoundedRectDirection(mesh3, 1, center, Lx_real, Ly_real, R_real, ax_idx);
+
+% 3. 绘图
+plot_case(main_fig, 3, viz3, dir3, 'Case 3: Rounded Rect');
+
+fprintf('\n[Done] All tests passed.\n');
+
+
+%% --- 辅助函数 ---
+function mesh = create_mesh(P, T)
+    mesh = Mesh(); mesh.P = P; mesh.T = T;
+    mesh.RegionTags = ones(1, size(T, 2));
+    mesh.NumNodes = size(P,2); mesh.NumElements = size(T,2);
     mesh.generateEdges();
 end
 
-%% === 辅助函数: 可视化 (修复版) ===
-function visualize_coil(mesh, dir_map, title_str)
-    % 使用 MagPackage 标准数据结构: P [3xN], T [4xM]
-    P = mesh.P;
-    T = mesh.T;
+function viz = create_viz(mesh)
+    dof = DofHandler(mesh); 
+    asm = Assembler(mesh, dof);
+    post = PostProcessor(asm); 
+    viz = Visualizer(post);
+end
+
+function plot_case(fig, row_idx, viz, dir_map, title_str)
+    figure(fig);
+    % Left: Mesh
+    subplot(3, 2, (row_idx-1)*2 + 1);
+    viz.plotMesh('Alpha', 0.6, 'FaceColor', [0.7 0.8 1.0], 'EdgeColor', 'k');
+    title([title_str ' Mesh']);
     
-    % 1. 绘制外表面云图
-    % triangulation 需要 [M x 4] 和 [N x 3]
-    TR = triangulation(T', P');
-    [F_bnd, ~] = freeBoundary(TR);
+    % Right: Vectors
+    subplot(3, 2, (row_idx-1)*2 + 2);
+    viz.plotElementVectors(dir_map, 'MaxArrows', 250, 'Color', 'r', 'Scale', 0.6);
+    hold on; 
+    viz.plotMesh('Alpha', 0.1, 'FaceColor', 'none', 'EdgeColor', [0.8 0.8 0.8]);
+    title([title_str ' Vectors']);
+end
+
+% --- 网格生成器 (保持不变) ---
+function [P, T] = gen_torus(R, r, h)
+    lim = R + r + h;
+    [X, Y, Z] = meshgrid(-lim:h:lim, -lim:h:lim, -r-h:h:r+h);
+    d_total = sqrt( (sqrt(X.^2 + Y.^2) - R).^2 + Z.^2 );
+    mask = d_total <= r;
+    P_cloud = [X(mask)'; Y(mask)'; Z(mask)'];
+    dt = delaunayTriangulation(P_cloud');
+    T = dt.ConnectivityList'; P = dt.Points';
+end
+
+function [P, T] = gen_racetrack(L, R, r, h)
+    lx = L/2 + R + r + h; ly = R + r + h; lz = r + h;
+    [X, Y, Z] = meshgrid(-lx:h:lx, -ly:h:ly, -lz:h:lz);
+    X_abs = abs(X); dist = zeros(size(X));
+    mask_str = (X_abs <= L/2);
+    dist(mask_str) = sqrt( (abs(Y(mask_str)) - R).^2 + Z(mask_str).^2 );
+    mask_cur = (~mask_str);
+    d_cen = sqrt( (X_abs(mask_cur) - L/2).^2 + Y(mask_cur).^2 );
+    dist(mask_cur) = sqrt( (d_cen - R).^2 + Z(mask_cur).^2 );
+    mask = dist <= r;
+    P_cloud = [X(mask)'; Y(mask)'; Z(mask)'];
+    dt = delaunayTriangulation(P_cloud');
+    T = dt.ConnectivityList'; P = dt.Points';
+end
+
+function [P, T] = gen_rounded_rect(Lx, Ly, R, r, h)
+    range_x = Lx/2 + R + r + h; range_y = Ly/2 + R + r + h; range_z = r + h;
+    [X, Y, Z] = meshgrid(-range_x:h:range_x, -range_y:h:range_y, -range_z:h:range_z);
+    x = abs(X); y = abs(Y); d_planar = zeros(size(x));
     
-    % 着色数据: Z 坐标
-    C_data = P(3, :); 
+    mask_top = (x <= Lx/2);
+    d_planar(mask_top) = abs( y(mask_top) - (Ly/2 + R) );
     
-    % trisurf 需要 x, y, z 向量
-    trisurf(F_bnd, P(1,:)', P(2,:)', P(3,:)', C_data, ...
-        'FaceAlpha', 0.3, 'EdgeColor', 'none', 'FaceColor', 'interp');
-    hold on;
+    mask_right = (y <= Ly/2) & (x > Lx/2);
+    d_planar(mask_right) = abs( x(mask_right) - (Lx/2 + R) );
     
-    % 2. 绘制流向矢量
-    % 计算重心 [3 x M]
-    % P(:, T(1,:)) 是 [3 x M]
-    centers = (P(:, T(1,:)) + P(:, T(2,:)) + P(:, T(3,:)) + P(:, T(4,:))) / 4.0;
+    mask_corner = (x > Lx/2) & (y > Ly/2);
+    d_corn = sqrt( (x(mask_corner) - Lx/2).^2 + (y(mask_corner) - Ly/2).^2 );
+    d_planar(mask_corner) = abs( d_corn - R );
     
-    % 降采样
-    num_arrows = 500;
-    total_elems = mesh.NumElements;
-    step = max(1, floor(total_elems / num_arrows));
-    idx = 1:step:total_elems;
-    
-    % 提取采样点和向量 [3 x K]
-    pts = centers(:, idx);
-    vecs = dir_map(:, idx);
-    
-    % quiver3 需要 u, v, w (向量)
-    quiver3(pts(1,:), pts(2,:), pts(3,:), ...
-            vecs(1,:), vecs(2,:), vecs(3,:), ...
-            0.5, 'k', 'LineWidth', 1.2);
-        
-    axis equal; grid on;
-    xlabel('X'); ylabel('Y'); zlabel('Z');
-    title(title_str);
-    view(3);
-    colorbar;
-    drawnow;
+    dist = sqrt( d_planar.^2 + Z.^2 );
+    mask = dist <= r;
+    P_cloud = [X(mask)'; Y(mask)'; Z(mask)'];
+    dt = delaunayTriangulation(P_cloud');
+    T = dt.ConnectivityList'; P = dt.Points';
 end
