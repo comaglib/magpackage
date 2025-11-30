@@ -1,6 +1,9 @@
 classdef NonlinearSolver < handle
-    % NONLINEARSOLVER 牛顿-拉夫逊非线性求解器 (v4.4 - Fast LS)
-    % 更新: 使用 flag=false 加速线搜索残差计算
+    % NONLINEARSOLVER 牛顿-拉夫逊非线性求解器 (v4.6 - Robust Fix)
+    % 
+    % 更新:
+    %   1. [Fix] 关闭 ReuseAnalysis。MATLAB sparse() 会自动丢弃零元，
+    %      导致 Jacobian 结构动态变化，MUMPS 重用分析会报错 -53。
     
     properties
         Assembler
@@ -23,6 +26,9 @@ classdef NonlinearSolver < handle
             obj.Assembler = assembler;
             obj.Config = assembler.Config;
             obj.LinearSolver = LinearSolver('Auto');
+            
+            % [Robustness] 必须关闭分析复用，因为 sparse() 不保证结构恒定
+            obj.LinearSolver.ReuseAnalysis = false;
         end
         
         function [x, info] = solve(obj, space, matLibData, sourceMap, fixedDofs, x0)

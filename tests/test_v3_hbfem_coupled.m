@@ -43,13 +43,13 @@ assembler = Assembler(mesh, dofHandler);
 solver = HBFEMCoupledSolver(assembler, aft, coil, R_circuit);
 
 M = assembler.assembleMass(space);
-temp_MatMap = [1/mu0];
+temp_MatMap = 1/mu0;
 K_lin = assembler.assembleStiffness(space, temp_MatMap);
 ref_val = full(mean(abs(diag(K_lin))));
 solver.MatrixK_Add = ref_val * 1e-5 * M; 
 
 % [Optimization] 调整求解参数以应对强饱和
-solver.MaxIter = 50;       % 增加迭代步数
+solver.MaxIter = 100;      % 增加迭代步数
 solver.Tolerance = 1e-3;   % 放宽收敛容差
 solver.MinStepSize = 1e-8; % 允许更小的步长
 
@@ -58,7 +58,7 @@ Target_V = 40000;
 idx_fund = find(harmonics == 1);
 V_vec = zeros(aft.NumHarmonics, 1);
 
-NumSteps = 2;
+NumSteps = 1;
 x_curr = zeros(numDofs, aft.NumHarmonics); 
 
 is_bnd = BoundaryCondition.findOuterBoundaryDofs(mesh, dofHandler, space);

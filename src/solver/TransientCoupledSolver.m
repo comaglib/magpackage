@@ -1,9 +1,8 @@
 classdef TransientCoupledSolver < handle
-    % TRANSIENTCOUPLEDSOLVER 场路耦合瞬态求解器 (v2.1 - Unsymmetric Fix)
+    % TRANSIENTCOUPLEDSOLVER 场路耦合瞬态求解器 (v2.3 - Robust Fix)
     % 
-    % 修复:
-    %   1. [Critical] 显式设置线性求解器为非对称模式 (Symmetric=false)。
-    %      场路耦合矩阵 [K -C; C' R] 本质上是非对称的，错误的对称假设会导致求解失败。
+    % 更新:
+    %   1. 关闭 LinearSolver.ReuseAnalysis。
     
     properties
         Assembler
@@ -27,9 +26,12 @@ classdef TransientCoupledSolver < handle
             obj.CircuitR = R;
             
             obj.LinearSolver = LinearSolver('Auto');
-            % [Fix] 耦合矩阵是非对称的 (-C vs C')
+            % 耦合矩阵是非对称的
             obj.LinearSolver.Symmetric = false; 
             obj.LinearSolver.MumpsICNTL.i14 = 50; 
+            
+            % [Robustness] 关闭重用以防止 -53 错误
+            obj.LinearSolver.ReuseAnalysis = false;
         end
         
         function [Solution, Info] = solve(obj, space, matLibData, timeParams, x0)

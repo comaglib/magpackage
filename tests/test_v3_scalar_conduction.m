@@ -64,7 +64,7 @@ fprintf('  - Theoretical I: %.4f A\n', I_theo);
 lossCalc = LossCalculator(assembler);
 % 我们需要给 LossCalculator 增加一个通用的 Grad-Grad 积分接口，或者直接用刚度矩阵
 % P = V' * S * V
-S = assembler.assembleScalarStiffness(space, SigmaMap);
+S = assembler.assembleScalarLaplacian(space, SigmaMap);
 P_fem = V_sol' * S * V_sol;
 
 I_fem = P_fem / 0.1;

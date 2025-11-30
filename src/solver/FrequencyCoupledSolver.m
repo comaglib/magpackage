@@ -1,14 +1,5 @@
 classdef FrequencyCoupledSolver < handle
-    % FREQUENCYCOUPLEDSOLVER 频域场路耦合求解器 (v1.0)
-    %
-    % 功能:
-    %   求解电压驱动的线性时谐磁场问题 (RL电路耦合)。
-    %   方程: 
-    %     1. (K + j*w*M_sigma + M_reg)*A - C*I = 0
-    %     2. j*w*C'*A + R*I = V
-    %   系统矩阵 (非对称):
-    %     [ Z_mag    -C ] [ A ]   [ 0 ]
-    %     [ jwC'      R ] [ I ] = [ V ]
+    % FREQUENCYCOUPLEDSOLVER 频域场路耦合求解器 (v1.2 - Robust Fix)
     
     properties
         Assembler
@@ -27,8 +18,10 @@ classdef FrequencyCoupledSolver < handle
             
             obj.LinearSolver = LinearSolver('Auto');
             obj.LinearSolver.MumpsICNTL.i14 = 60; 
-            % [Critical] 耦合矩阵本质上是非对称的
             obj.LinearSolver.Symmetric = false; 
+            
+            % [Robustness]
+            obj.LinearSolver.ReuseAnalysis = false;
         end
         
         function [Solution, Info] = solve(obj, space, nuMap, sigmaMap, V_phasor, fixedDofs)
@@ -61,12 +54,7 @@ classdef FrequencyCoupledSolver < handle
             C_vec = obj.Assembler.assembleWinding(space, obj.WindingObj);
             
             % 3. 组装系统矩阵
-            % 扩展系统大小: NumDofs + 1 (Current I)
             sys_size = numDofs + 1;
-            
-            % 构建块矩阵
-            % [ Z_mag    -C ]
-            % [ jwC'      R ]
             top_right = -C_vec;
             bot_left = 1j * omega * C_vec';
             bot_right = sparse(obj.CircuitR);
@@ -78,9 +66,7 @@ classdef FrequencyCoupledSolver < handle
             RHS(end) = V_phasor; 
             
             % 5. 处理边界条件
-            % 仅固定 A 的 DoF，I 是自由的
             is_fixed_sys = [fixedDofs; false];
-            
             [S_sys, F_sys] = BoundaryCondition.applyDirichlet(SystemMatrix, RHS, is_fixed_sys);
             
             % 6. 求解

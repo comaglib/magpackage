@@ -1,8 +1,5 @@
 classdef FrequencySolver < handle
-    % FREQUENCYSOLVER 频域时谐磁场求解器 (v1.1 - Fix Variable Name)
-    % 
-    % 修复:
-    %   1. 修正了变量名不一致导致的 M_sigma 无法识别错误。
+    % FREQUENCYSOLVER 频域时谐磁场求解器 (v1.3 - Robust Fix)
     
     properties
         Assembler
@@ -16,6 +13,9 @@ classdef FrequencySolver < handle
             obj.Frequency = freq;
             obj.LinearSolver = LinearSolver('Auto');
             obj.LinearSolver.MumpsICNTL.i14 = 60; 
+            
+            % [Robustness]
+            obj.LinearSolver.ReuseAnalysis = false;
         end
         
         function A_phasor = solve(obj, space, nuMap, sigmaMap, sourceMap, fixedDofs)
@@ -31,10 +31,10 @@ classdef FrequencySolver < handle
             % 2. 组装加权质量矩阵 M_sigma
             if all(sigmaMap == 0)
                 fprintf('   [Info] Conductivity is zero everywhere. Solving Magnetostatic AC.\n');
-                M_sigma = sparse(size(K,1), size(K,2)); % [Fix] 变量名统一为 M_sigma
+                M_sigma = sparse(size(K,1), size(K,2)); 
             else
                 fprintf('   [Info] Assembling Eddy Current terms...\n');
-                M_sigma = obj.Assembler.assembleMassWeighted(space, sigmaMap); % [Fix] 变量名统一为 M_sigma
+                M_sigma = obj.Assembler.assembleMassWeighted(space, sigmaMap); 
             end
             
             % 3. 构建系统矩阵 S = K + j*w*M
