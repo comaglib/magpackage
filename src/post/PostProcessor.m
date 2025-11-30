@@ -226,7 +226,7 @@ classdef PostProcessor < handle
                 Energy = obj.integrate_energy_kernel(packedData, A_sol, MatLibData);
             end
         end
-
+        
         function total_W = integrate_energy_kernel(obj, PackedData, A_sol, MatLibData)
              % ... (保持原有代码) ...
             C_P = parallel.pool.Constant(PackedData.P);
