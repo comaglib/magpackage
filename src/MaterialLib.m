@@ -1,9 +1,11 @@
 classdef MaterialLib
-    % MATERIALLIB 无状态材料库 (v3.3 - Clamped Safe)
+    % MATERIALLIB 无状态材料库 (v3.4 - Robust Interpolation)
     % 
-    % 修复:
-    % 1. 增加 spline 范围检查，防止 B 场过大时的样条外插发散。
-    % 2. 保证饱和区导数行为的物理一致性。
+    % 修复日志:
+    % 1. [Crash Fix] createNonlinear 中增加了 unique() 处理。
+    %    原因: 当 B-H 曲线进入深度饱和区 (如 tanh) 时，B 值可能在机器精度下重复，
+    %    导致 pchip 插值报错 "The first input must contain unique values"。
+    % 2. 强制输入数据为正值并排序，确保单调性。
     
     methods (Static)
         function [nu, dnu_db2] = evaluate(B_sq, matData)
@@ -22,11 +24,8 @@ classdef MaterialLib
                     nu = ones(size(B_sq)) * val; dnu_db2 = zeros(size(B_sq));
                 end
             else
-                % [关键修复] 输入截断
-                % 防止 B_sq 超出样条定义的范围导致外插数值爆炸
-                % 对于超出范围的 B，我们认为材料性质保持为最后一点的状态 (完全饱和)
+                % [输入截断] 防止 B_sq 超出样条范围
                 B_sq_clamped = B_sq;
-                
                 if isfield(matData, 'MaxBSq')
                     mask_high = B_sq > matData.MaxBSq;
                     if any(mask_high)
@@ -38,19 +37,13 @@ classdef MaterialLib
                 nu = ppval(matData.SplineNu, B_sq_clamped);
                 dnu_db2 = ppval(matData.SplineDNu, B_sq_clamped);
                 
-                % [额外防御] 对于超出范围的点，导数设为 0 (假设进入线性饱和区)
-                % 或者保留最后一点的导数？保留最后一点导数更符合 Newton 法的光滑要求
-                % 但物理上，深度饱和后 nu 趋于 nu0 (常数)，所以导数趋于 0 是对的
-                % 这里我们保持 Spline 的最后导数，防止雅可比矩阵突变
-                
-                % 安全防御: nu 不超过 nu0
+                % [安全防御] 物理约束
                 mask_overflow = nu > nu0;
                 if any(mask_overflow)
                     nu(mask_overflow) = nu0;
                     dnu_db2(mask_overflow) = 0; 
                 end
                 
-                % 安全防御: nu 不为负
                 mask_neg = nu < 0;
                 if any(mask_neg)
                     nu(mask_neg) = nu0; 
@@ -70,28 +63,46 @@ classdef MaterialLib
             mu0 = 4*pi*1e-7;
             nu0 = 1.0 / mu0;
             
-            B_curve = B_curve(:);
-            H_curve = H_curve(:);
+            % 1. 预处理: 确保列向量且为非负
+            B_curve = abs(B_curve(:));
+            H_curve = abs(H_curve(:));
+            
+            % 2. 排序: 按 B 升序排列
+            [B_curve, sortIdx] = sort(B_curve);
+            H_curve = H_curve(sortIdx);
+            
+            % 3. [关键修复] 去重
+            % pchip 要求自变量严格单调。如果 B 饱和变平，会有重复值。
+            % 'first' 策略: 保留进入饱和区的第一个点，丢弃后续重复点。
+            % (物理上 B-H 曲线即使饱和也不应完全平坦，应有 mu0 斜率，
+            % 但为了支持合成数据，去重是必要的)
+            [B_unique, uniqueIdx] = unique(B_curve, 'first');
+            H_unique = H_curve(uniqueIdx);
             
             % 记录定义域上限
-            matData.MaxBSq = max(B_curve.^2);
+            matData.MaxBSq = max(B_unique.^2);
             
-            B_sq = B_curve.^2;
-            Nu = zeros(size(B_curve));
+            B_sq = B_unique.^2;
+            Nu = zeros(size(B_unique));
             
-            mask_nonzero = B_curve > 1e-12;
-            Nu(mask_nonzero) = H_curve(mask_nonzero) ./ B_curve(mask_nonzero);
+            % 计算 Nu = H / B
+            mask_nonzero = B_unique > 1e-12;
+            Nu(mask_nonzero) = H_unique(mask_nonzero) ./ B_unique(mask_nonzero);
             
+            % 处理原点 (0/0) 或极小值
             if ~mask_nonzero(1)
-                if length(B_curve) > 1
-                    Nu(1) = H_curve(2) / B_curve(2);
+                if length(B_unique) > 1
+                    % 简单处理: 假设原点斜率与第二点连续
+                    Nu(1) = Nu(2); 
                 else
                     Nu(1) = nu0;
                 end
             end
             
+            % 物理截断: 磁阻率不能超过真空 (相对磁导率不能小于1)
             Nu(Nu > nu0) = nu0;
             
+            % 构建样条
             matData.Type = 'Nonlinear';
             matData.SplineNu = pchip(B_sq, Nu);
             matData.SplineDNu = fnder(matData.SplineNu, 1);

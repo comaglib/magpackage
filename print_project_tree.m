@@ -38,7 +38,7 @@ function traverse_dir(currentPath, prefix)
     items = items(~isHidden);
     
     % 3. (可选) 自定义忽略列表，例如忽略二进制输出目录
-    ignoreList = {'bin', 'obj', 'DerivedData', '__pycache__'};
+    ignoreList = {'obj', 'DerivedData', '__pycache__'};
     items = items(~ismember({items.name}, ignoreList));
     
     % --- 排序优化 ---

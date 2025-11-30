@@ -37,16 +37,18 @@ MatLibData(1) = MaterialLib.createNonlinear(B_arr, H_arr);
 
 coil = Winding('Coil1', 1, 100, 1.0, 1.0, [0,0,1]); 
 R_circuit = 1.0;
+L_circuit = 0.0; % [Update] 新增电感参数，保持为0以匹配原测试
 
 % --- 5. Solver ---
 assembler = Assembler(mesh, dofHandler);
-solver = HBFEMCoupledSolver(assembler, aft, coil, R_circuit);
+% [Update] 构造函数调用更新，传入 L
+solver = HBFEMCoupledSolver(assembler, aft, coil, R_circuit, L_circuit);
 
-M = assembler.assembleMass(space);
-temp_MatMap = 1/mu0;
-K_lin = assembler.assembleStiffness(space, temp_MatMap);
-ref_val = full(mean(abs(diag(K_lin))));
-solver.MatrixK_Add = ref_val * 1e-5 * M; 
+% [Removed] 移除了手动正则化代码，现在由 Solver 内部自动处理
+% M = assembler.assembleMass(space);
+% temp_MatMap = 1/mu0;
+% K_lin = ...
+% solver.MatrixK_Add = ... 
 
 % [Optimization] 调整求解参数以应对强饱和
 solver.MaxIter = 100;      % 增加迭代步数

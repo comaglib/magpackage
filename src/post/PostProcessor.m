@@ -1,9 +1,10 @@
 classdef PostProcessor < handle
-    % POSTPROCESSOR 有限元后处理模块 (v3.2 - Enhanced Probing & Smoothing)
+    % POSTPROCESSOR 有限元后处理模块 (v3.3 - A-V Coupling Support)
     % 
-    % 更新:
-    %   1. 新增 probeLine 方法，支持沿线段批量采样。
-    %   2. 新增 mapElementsToNodes 方法，支持将单元值平滑平均到节点。
+    % 功能:
+    %   1. 场量探测 (Probe): 支持 B 场、A 场、以及包含电位梯度的总电流密度 J。
+    %   2. 能量计算: 磁场能量积分。
+    %   3. 节点平滑: 将单元值映射到节点以便绘图。
     
     properties
         Assembler
@@ -18,6 +19,7 @@ classdef PostProcessor < handle
             obj.Mesh = assembler.Mesh;
             obj.DofHandler = assembler.DofHandler;
             
+            % 初始化三角剖分对象用于快速点定位
             if ~isempty(obj.Mesh.T)
                 T_double = double(obj.Mesh.T');
                 P_double = double(obj.Mesh.P');
@@ -30,19 +32,25 @@ classdef PostProcessor < handle
             centers = (P(:, T(1,:)) + P(:, T(2,:)) + P(:, T(3,:)) + P(:, T(4,:))) / 4.0;
         end
         
-        % --- 核心计算 ---
+        % =================================================================
+        %  核心场量计算 (批量)
+        % =================================================================
+        
         function B_elems = computeElementB(obj, A_sol, spaceName)
+            % COMPUTEELEMENTB 计算每个单元中心的磁通密度 B
             if nargin < 3
-                keys = obj.DofHandler.DofMaps.keys; targetKey = keys{1}; 
-                dofMap = obj.DofHandler.DofMaps(targetKey);
-            else
-                dofMap = obj.DofHandler.DofMaps(spaceName);
+                % 默认尝试获取第一个 Space
+                keys = obj.DofHandler.DofMaps.keys; 
+                spaceName = keys{1}; 
             end
+            
+            dofMap = obj.DofHandler.DofMaps(spaceName);
             
             numElems = fix(full(double(obj.Mesh.NumElements)));
             numCols = size(A_sol, 2);
             B_elems = zeros(3, numElems, numCols);
             
+            % 使用 Parallel Pool Constant 优化大数据传输
             C_P = parallel.pool.Constant(obj.Mesh.P);
             C_T = parallel.pool.Constant(obj.Mesh.T);
             C_Signs = parallel.pool.Constant(double(obj.Mesh.T2E_Sign));
@@ -59,46 +67,35 @@ classdef PostProcessor < handle
                 
                 nodes = loc_T(:, e); p_elem = loc_P(:, nodes); 
                 [J_mat, detJ] = compute_jacobian_tet(p_elem); invDetJ = 1.0 / detJ;
+                
+                % Piola Transform for Curl: curl = (1/detJ) * J * curl_ref
                 C_phy = (C_ref * J_mat') * invDetJ;
                 
                 dofs = loc_DofMap(:, e); s = loc_Signs(:, e);
                 A_local_all = loc_Sol(dofs, :) .* s;
+                
                 B_elems(:, e, :) = C_phy' * A_local_all;
             end
         end
         
-        % --- 节点平滑 (New) ---
         function Val_nodes = mapElementsToNodes(obj, Val_elems)
             % MAPELEMENTSTONODES 将单元中心值平均到节点上 (用于平滑云图)
-            % 输入: Val_elems [Dimensions x NumElements]
-            % 输出: Val_nodes [Dimensions x NumNodes]
-            
             numNodes = obj.Mesh.NumNodes;
             numElems = obj.Mesh.NumElements;
             [dims, ~] = size(Val_elems);
             
             Val_nodes = zeros(dims, numNodes);
-            Count_nodes = zeros(1, numNodes);
-            
             T = obj.Mesh.T; % [4 x Ne]
             
-            % 累加 (这也支持并行，但累加操作需注意，这里用简单的循环即可，速度通常够快)
-            % 为了加速，我们可以利用 sparse 矩阵的累加特性
-            
             for d = 1:dims
-                % 构建稀疏矩阵：行=节点，列=单元，值=该单元的分量值
-                % 但更简单的方法是直接累加
                 v = Val_elems(d, :); 
                 
-                % 展开 T 和 值
-                % T(:) 是所有节点索引
-                % repmat(v, 4, 1) 将值赋给单元的4个节点
-                
+                % 将单元值广播到其4个节点
                 node_idxs = T(:);
                 vals_expanded = repmat(v, 4, 1);
                 vals_expanded = vals_expanded(:);
                 
-                % accumarray 极快
+                % 累加到节点
                 sum_d = accumarray(node_idxs, vals_expanded, [numNodes, 1]);
                 Val_nodes(d, :) = sum_d';
             end
@@ -108,12 +105,53 @@ classdef PostProcessor < handle
             node_counts = accumarray(T(:), ones_expanded, [numNodes, 1]);
             
             % 平均
-            node_counts(node_counts == 0) = 1; % 防止除以0
+            node_counts(node_counts == 0) = 1; 
             Val_nodes = Val_nodes ./ repmat(node_counts', dims, 1);
         end
 
-        % --- 探针工具 ---
+        % =================================================================
+        %  单点探测工具 (Probe)
+        % =================================================================
+        
+        function [J_total, elem_idx] = probeTotalCurrent(obj, point, A_sol, V_sol, omega, sigmaMap, sourceMap)
+            % PROBETOTALCURRENT 计算点处的总电流密度
+            % J_total = J_source + J_eddy
+            %         = J_source + sigma * (-j*omega*A - grad(V))
+            
+            % 1. 查找单元
+            if isempty(obj.Triangulation), error('Triangulation not initialized.'); end
+            elem_idx = pointLocation(obj.Triangulation, point(:)');
+            
+            if isnan(elem_idx)
+                J_total = [0;0;0];
+                return;
+            end
+            
+            % 2. 获取材料参数 (Sigma)
+            tag = obj.Mesh.RegionTags(elem_idx);
+            sigma = obj.getPropertyValue(sigmaMap, tag, 0);
+            
+            % 3. 获取源电流 (J_source)
+            J_s = obj.getPropertyValue(sourceMap, tag, [0,0,0]);
+            J_s = J_s(:);
+            
+            % 4. 计算 A 场 (Nedelec 插值)
+            [A_val, ~] = obj.internalProbeNedelec(A_sol, elem_idx, point, 'Nedelec_P1');
+            
+            % 5. 计算 grad(V) (Lagrange 梯度)
+            if ~isempty(V_sol)
+                GradV_val = obj.internalProbeLagrangeGrad(V_sol, elem_idx, 'Lagrange_P1');
+            else
+                GradV_val = [0;0;0];
+            end
+            
+            % 6. 合成总电流
+            E_eddy = -1j * omega * A_val - GradV_val;
+            J_total = J_s + sigma * E_eddy;
+        end
+        
         function [B_val, elem_idx] = probeB(obj, A_sol, point)
+            % PROBEB 计算点处的磁通密度 B = curl(A)
             if isempty(obj.Triangulation), error('Triangulation not initialized.'); end
             elem_idx = pointLocation(obj.Triangulation, point(:)');
             
@@ -122,19 +160,30 @@ classdef PostProcessor < handle
                 return;
             end
             
-            % 复用内部逻辑 (简化版，不重复 computeElementB 的全部)
-            keys = obj.DofHandler.DofMaps.keys; dofMap = obj.DofHandler.DofMaps(keys{1});
-            nodes = obj.Mesh.T(:, elem_idx); p_elem = obj.Mesh.P(:, nodes);
-            [J_mat, detJ] = compute_jacobian_tet(p_elem); invDetJ = 1.0 / detJ;
-            q_center = [0.25; 0.25; 0.25]; [~, curl_ref] = nedelec_tet_p1(q_center);
-            C_ref = reshape(curl_ref, 6, 3); C_phy = (C_ref * J_mat') * invDetJ;
+            % 复用内部逻辑
+            dofMap = obj.DofHandler.DofMaps('Nedelec_P1');
+            nodes = obj.Mesh.T(:, elem_idx); 
+            p_elem = obj.Mesh.P(:, nodes);
             
-            dofs = dofMap(:, elem_idx); s = double(obj.Mesh.T2E_Sign(:, elem_idx));
+            [J_mat, detJ] = compute_jacobian_tet(p_elem); 
+            invDetJ = 1.0 / detJ;
+            
+            q_center = [0.25; 0.25; 0.25]; % 常数旋度，任意点即可
+            [~, curl_ref] = nedelec_tet_p1(q_center);
+            C_ref = reshape(curl_ref, 6, 3);
+            
+            % Piola Transform
+            C_phy = (C_ref * J_mat') * invDetJ;
+            
+            dofs = dofMap(:, elem_idx); 
+            s = double(obj.Mesh.T2E_Sign(:, elem_idx));
             A_local = A_sol(dofs, :) .* s;
+            
             B_val = C_phy' * A_local;
         end
         
         function [A_val, elem_idx] = probeSolution(obj, A_sol, point)
+            % PROBESOLUTION 计算点处的磁矢位 A (Nedelec 插值)
             if isempty(obj.Triangulation), error('Triangulation not initialized.'); end
             elem_idx = pointLocation(obj.Triangulation, point(:)');
             
@@ -143,42 +192,18 @@ classdef PostProcessor < handle
                 return;
             end
             
-            keys = obj.DofHandler.DofMaps.keys; dofMap = obj.DofHandler.DofMaps(keys{1});
-            nodes = obj.Mesh.T(:, elem_idx); p_elem = obj.Mesh.P(:, nodes);
-            [J_mat, ~] = compute_jacobian_tet(p_elem);
-            x_ref = J_mat \ (point(:) - p_elem(:,1));
-            [val_ref, ~] = nedelec_tet_p1(x_ref); 
-            invJt = inv(J_mat)'; N_phy = val_ref * invJt'; 
-            dofs = dofMap(:, elem_idx); s = double(obj.Mesh.T2E_Sign(:, elem_idx));
-            A_local = A_sol(dofs, :) .* s; 
-            A_val = N_phy' * A_local;
-        end
-        
-        function [J_val, elem_idx] = probeEddyCurrent(obj, A_sol, point, omega, sigmaMap)
-            [A_val, elem_idx] = obj.probeSolution(A_sol, point);
-            if isnan(elem_idx)
-                J_val = zeros(3, size(A_sol, 2));
-                return;
-            end
-            tag = obj.Mesh.RegionTags(elem_idx);
-            if tag > length(sigmaMap) || tag < 1, sigma = 0; else, sigma = sigmaMap(tag); end
-            J_val = -1j * omega * sigma * A_val;
+            [A_val, ~] = obj.internalProbeNedelec(A_sol, elem_idx, point, 'Nedelec_P1');
         end
         
         function result = probeLine(obj, A_sol, startPt, endPt, numPts, type, varargin)
             % PROBELINE 沿线段采样
-            % 输入:
-            %   type: 'B', 'A', 'J'
-            %   varargin: 额外参数 (如 J 需要 omega, sigmaMap)
-            
+            % type: 'B', 'A', 'J'
             pts = [linspace(startPt(1), endPt(1), numPts)', ...
                    linspace(startPt(2), endPt(2), numPts)', ...
                    linspace(startPt(3), endPt(3), numPts)'];
             
-            result = zeros(numPts, 3); % 假设都是矢量
+            result = zeros(numPts, 3); 
             
-            % 循环调用 (pointLocation 虽然有向量化版本，但为了逻辑复用，这里先用循环)
-            % 优化: 如果 numPts 很大，应重构 probeB 接受点列表
             for k = 1:numPts
                 pt = pts(k, :);
                 if strcmpi(type, 'B')
@@ -186,11 +211,12 @@ classdef PostProcessor < handle
                 elseif strcmpi(type, 'A')
                     val = obj.probeSolution(A_sol, pt);
                 elseif strcmpi(type, 'J')
-                    val = obj.probeEddyCurrent(A_sol, pt, varargin{:});
+                    % 对于 J，varargin 需包含 V_sol, omega, sigmaMap, sourceMap
+                    val = obj.probeTotalCurrent(pt, A_sol, varargin{:});
                 else
                     error('Unknown probe type');
                 end
-                result(k, :) = val.'; % 转置为行
+                result(k, :) = val.'; 
             end
         end
 
@@ -201,26 +227,30 @@ classdef PostProcessor < handle
             mag = reshape(mag, Ne, K);
         end
         
-        % (保留 Energy 方法不变...)
+        % =================================================================
+        %  能量计算
+        % =================================================================
+        
         function Energy = computeMagneticEnergy(obj, A_sol, MatLibData)
-             % ... (保持原有代码) ...
+            % 检查材料是否全线性
             all_linear = true;
             for i = 1:length(MatLibData)
                 if ~strcmp(MatLibData(i).Type, 'Linear')
                     all_linear = false; break;
                 end
             end
-            keys = obj.DofHandler.DofMaps.keys;
             space = FunctionSpace('Nedelec', 1); 
             
             if all_linear
+                % 线性情况：E = 0.5 * A' * K * A
                 NuMap = zeros(length(MatLibData), 1);
                 for i = 1:length(MatLibData)
                     NuMap(i) = MatLibData(i).Nu_Linear;
                 end
                 K = obj.Assembler.assembleStiffness(space, NuMap);
-                Energy = 0.5 * A_sol' * K * A_sol;
+                Energy = 0.5 * real(A_sol' * K * A_sol);
             else
+                % 非线性情况：逐单元积分 \int ( \int H dB ) dV
                 packedData = obj.Assembler.preparePackedData(space);
                 packedData.RegionTags = obj.Mesh.RegionTags;
                 Energy = obj.integrate_energy_kernel(packedData, A_sol, MatLibData);
@@ -228,7 +258,6 @@ classdef PostProcessor < handle
         end
         
         function total_W = integrate_energy_kernel(obj, PackedData, A_sol, MatLibData)
-             % ... (保持原有代码) ...
             C_P = parallel.pool.Constant(PackedData.P);
             C_T = parallel.pool.Constant(PackedData.T);
             C_Dofs = parallel.pool.Constant(PackedData.CellDofs);
@@ -273,6 +302,7 @@ classdef PostProcessor < handle
                     if strcmp(matData.Type, 'Linear')
                         w_density = 0.5 * matData.Nu_Linear * B_sq;
                     else
+                        % 简化的共能/能量密度积分 (梯形公式近似)
                         b_samples = [0, 0.5*B_mag, B_mag];
                         b_sq_samples = b_samples.^2;
                         nu_vals = zeros(1,3);
@@ -288,6 +318,99 @@ classdef PostProcessor < handle
                 W_local(e) = w_sum;
             end
             total_W = sum(W_local);
+        end
+    end
+    
+    % =================================================================
+    %  私有辅助函数
+    % =================================================================
+    methods (Access = private)
+        function [val, J_mat] = internalProbeNedelec(obj, solVec, elem_idx, point, spaceName)
+            % 封装 Nedelec 插值逻辑
+            dofMap = obj.DofHandler.DofMaps(spaceName);
+            nodes = obj.Mesh.T(:, elem_idx); 
+            p_elem = obj.Mesh.P(:, nodes);
+            
+            [J_mat, ~] = compute_jacobian_tet(p_elem);
+            
+            % 物理坐标 -> 参考坐标
+            x_ref = J_mat \ (point(:) - p_elem(:,1));
+            
+            [val_ref, ~] = nedelec_tet_p1(x_ref); 
+            
+            % H(curl) Piola 变换: u = J^{-T} * u_ref
+            invJt = inv(J_mat)'; 
+            N_phy = val_ref * invJt'; 
+            
+            dofs = dofMap(:, elem_idx); 
+            s = double(obj.Mesh.T2E_Sign(:, elem_idx));
+            
+            local_coeffs = solVec(dofs) .* s; 
+            val = N_phy' * local_coeffs;
+        end
+        
+        function grad_val = internalProbeLagrangeGrad(obj, solVec, elem_idx, spaceName)
+            % 封装 Lagrange P1 梯度计算逻辑
+            dofMap = obj.DofHandler.DofMaps(spaceName);
+            
+            % 处理全局索引到局部向量索引的转换
+            global_dofs = dofMap(:, elem_idx);
+            if obj.DofHandler.SpaceOffsets.isKey(spaceName)
+                offset = obj.DofHandler.SpaceOffsets(spaceName);
+            else
+                offset = 0;
+            end
+            local_dofs = global_dofs - offset;
+            
+            nodes = obj.Mesh.T(:, elem_idx); 
+            p_elem = obj.Mesh.P(:, nodes);
+            [J_mat, ~] = compute_jacobian_tet(p_elem);
+            
+            % P1 梯度参考值 (常数)
+            q_ref = [0.25; 0.25; 0.25];
+            [~, grad_ref] = lagrange_tet_p1(q_ref); % [4x3]
+            
+            % H(grad) Piola 变换: grad = J^{-T} * grad_ref
+            invJt = inv(J_mat)';
+            Grad_phy = grad_ref * invJt'; % [4x3]
+            
+            local_coeffs = solVec(local_dofs);
+            grad_val = Grad_phy' * local_coeffs; % [3x1]
+        end
+        
+        function val = getPropertyValue(~, mapOrArray, tag, defaultVal)
+            % 统一处理 Map 或 Array 形式的属性查询
+            if isa(mapOrArray, 'containers.Map')
+                if mapOrArray.isKey(tag)
+                    val = mapOrArray(tag);
+                else
+                    val = defaultVal;
+                end
+            elseif isnumeric(mapOrArray)
+                if isscalar(mapOrArray)
+                    val = mapOrArray; % 标量
+                elseif numel(mapOrArray) >= 3 && numel(mapOrArray) <= 3
+                     % 可能是 [Jx, Jy, Jz] 向量作为标量传入?
+                     % 简单处理：如果是列向量且长度为属性总数...
+                     % 这里假设如果是 Array，则 Array(tag) 是值，或者 Array 是 uniform 值
+                     if tag <= length(mapOrArray)
+                        val = mapOrArray(tag);
+                     else
+                        val = defaultVal;
+                     end
+                else
+                     % 处理 [3 x 1] 向量直接作为 SourceMap 传入的情况
+                     if isvector(mapOrArray) && length(mapOrArray) == 3
+                         val = mapOrArray;
+                     elseif tag <= length(mapOrArray)
+                         val = mapOrArray(tag);
+                     else
+                         val = defaultVal;
+                     end
+                end
+            else
+                val = defaultVal;
+            end
         end
     end
 end

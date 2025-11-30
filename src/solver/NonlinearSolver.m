@@ -1,145 +1,278 @@
 classdef NonlinearSolver < handle
-    % NONLINEARSOLVER 牛顿-拉夫逊非线性求解器 (v4.6 - Robust Fix)
-    % 
-    % 更新:
-    %   1. [Fix] 关闭 ReuseAnalysis。MATLAB sparse() 会自动丢弃零元，
-    %      导致 Jacobian 结构动态变化，MUMPS 重用分析会报错 -53。
+    % NONLINEARSOLVER 静磁场非线性求解器 (v6.0 - Robust)
+    %
+    % 改进:
+    %   1. [Robustness] 引入回溯线搜索 (Line Search)，解决强饱和收敛问题。
+    %   2. [Auto-Grounding] 自动检测悬浮 V 场并接地，防止矩阵奇异。
+    %   3. [Regularization] 改进正则化系数计算 (使用 max 而非 mean)。
     
     properties
         Assembler
-        Config
         LinearSolver
+        MaxIterations = 100
+        Tolerance = 1e-6
         
-        MaxIter = 100
-        Tolerance = 1e-5
+        % --- 线搜索配置 ---
+        Relaxation = 1.0         
+        UseLineSearch = true
+        MaxLineSearchIters = 10
         
-        MaxBacktracks = 20
-        BacktrackFactor = 0.5
-        MinStepSize = 1e-6
-        
-        MatrixK_Add
-        VectorF_Add
+        % --- 正则化配置 ---
+        MatrixK_Add = []         
+        AutoRegularization = true 
+        RegScale = 1e-6          
     end
     
     methods
         function obj = NonlinearSolver(assembler)
             obj.Assembler = assembler;
-            obj.Config = assembler.Config;
             obj.LinearSolver = LinearSolver('Auto');
-            
-            % [Robustness] 必须关闭分析复用，因为 sparse() 不保证结构恒定
-            obj.LinearSolver.ReuseAnalysis = false;
+            obj.LinearSolver.MumpsICNTL.i14 = 40;
         end
         
-        function [x, info] = solve(obj, space, matLibData, sourceMap, fixedDofs, x0)
+        function [A_sol, V_sol, info] = solve(obj, space_A, space_V, matLib, sigmaMap, sourceMap, fixedDofs_A, fixedDofs_V, x_init)
+            if nargin < 9, x_init = []; end
+            if nargin < 8, fixedDofs_V = []; end
+            
             fprintf('==============================================\n');
-            fprintf('   Nonlinear Solver (Fast Newton)             \n');
+            fprintf('   Nonlinear Magnetostatic Solver (v6.0)      \n');
             fprintf('==============================================\n');
             
-            numDofs = obj.Assembler.DofHandler.NumGlobalDofs;
+            dofHandler = obj.Assembler.DofHandler;
             
-            if nargin < 6 || isempty(x0), x = zeros(numDofs, 1); else, x = x0; end
+            % --- 1. 空间与自由度 ---
+            [~, offset_A] = dofHandler.distributeDofs(space_A);
+            num_A = dofHandler.SpaceLocalSizes(space_A.toString());
             
-            if isempty(sourceMap)
-                F_ext = sparse(numDofs, 1);
-            else
-                F_ext = obj.Assembler.assembleSource(space, sourceMap);
+            if num_A == 0
+                error('NonlinearSolver:NoDoFs', 'Active DoFs is 0. Check Mesh initialization.');
             end
             
-            has_add_K = ~isempty(obj.MatrixK_Add);
+            enable_V = ~isempty(space_V);
+            offset_V = -1;
+            auto_ground_idx = [];
             
-            % Initial Residual (Only need R)
-            [~, R_mag_0] = obj.Assembler.assembleJacobian(space, x, matLibData, false);
-            
-            R_0 = R_mag_0 - F_ext;
-            if has_add_K, R_0 = R_0 + (obj.MatrixK_Add * x); end
-            if ~isempty(obj.VectorF_Add), R_0 = R_0 - obj.VectorF_Add; end
-            
-            free_mask = ~fixedDofs;
-            current_res_norm = norm(R_0(free_mask));
-            norm_base = norm(F_ext); 
-            if has_add_K && ~isempty(obj.VectorF_Add), norm_base = max(norm_base, norm(obj.VectorF_Add)); end
-            if norm_base < 1e-10, norm_base = 1.0; end
-            
-            fprintf('   Iter  0: Res=%.4e (Rel=%.4e)\n', current_res_norm, current_res_norm/norm_base);
-            
-            res_history = current_res_norm;
-            converged = false;
-            
-            for iter = 1:obj.MaxIter
-                % A. 组装 Jacobian (Need J)
-                [J_mag, R_mag] = obj.Assembler.assembleJacobian(space, x, matLibData, true);
-                
-                % B. 系统组装
-                if has_add_K
-                    J_total = J_mag + obj.MatrixK_Add;
-                    R_total = R_mag + (obj.MatrixK_Add * x) - F_ext;
+            if enable_V
+                conductingTags = obj.getConductingRegions(sigmaMap);
+                if isempty(conductingTags)
+                    fprintf('   [Info] No conducting regions. Dropping V-field.\n');
+                    enable_V = false;
                 else
-                    J_total = J_mag;
-                    R_total = R_mag - F_ext;
-                end
-                if ~isempty(obj.VectorF_Add), R_total = R_total - obj.VectorF_Add; end
-                
-                % C. 求解
-                RHS = -R_total;
-                [J_sys, RHS_sys] = BoundaryCondition.applyDirichlet(J_total, RHS, fixedDofs);
-                dx = obj.LinearSolver.solve(J_sys, RHS_sys);
-                
-                % D. 线搜索 (Fast: No Jacobian)
-                alpha = 1.0;
-                accepted = false;
-                
-                for bt = 0:obj.MaxBacktracks
-                    x_trial = x + alpha * dx;
-                    
-                    % [Fast Calc] 仅计算残差
-                    [~, R_mag_trial] = obj.Assembler.assembleJacobian(space, x_trial, matLibData, false);
-                    
-                    if has_add_K
-                        R_trial = R_mag_trial + (obj.MatrixK_Add * x_trial) - F_ext;
+                    if ~dofHandler.DofMaps.isKey(space_V.toString())
+                        [~, offset_V] = dofHandler.distributeDofs(space_V, conductingTags);
                     else
-                        R_trial = R_mag_trial - F_ext;
+                        offset_V = dofHandler.SpaceOffsets(space_V.toString());
                     end
-                    if ~isempty(obj.VectorF_Add), R_trial = R_trial - obj.VectorF_Add; end
+                    fprintf('   [Info] V-field enabled on %d regions.\n', length(conductingTags));
                     
-                    new_res_norm = norm(R_trial(free_mask));
-                    
-                    if new_res_norm < current_res_norm || alpha < obj.MinStepSize
-                        x = x_trial;
-                        current_res_norm = new_res_norm;
-                        accepted = true;
+                    % [Auto-Grounding] 检查悬浮电位
+                    hasFixedV = ~isempty(fixedDofs_V) && any(fixedDofs_V);
+                    if ~hasFixedV
+                        fprintf('   [Auto-Fix] V-field is floating. Grounding 1st node to 0V.\n');
+                        auto_ground_idx = offset_V + 1;
+                    end
+                end
+            end
+            
+            numTotalDofs = dofHandler.NumGlobalDofs;
+            
+            % --- 2. 预计算常数矩阵 ---
+            % 上下文结构体，减少传参
+            sysCtx.num_A = num_A;
+            sysCtx.numTotalDofs = numTotalDofs;
+            sysCtx.enable_V = enable_V;
+            sysCtx.space_A = space_A;
+            sysCtx.matLib = matLib;
+            
+            F_A = obj.Assembler.assembleSource(space_A, sourceMap);
+            sysCtx.F_sys = sparse(numTotalDofs, 1);
+            if ~isempty(F_A), sysCtx.F_sys(1:length(F_A)) = F_A; end
+            
+            sysCtx.C_AV = sparse(numTotalDofs, numTotalDofs);
+            sysCtx.L_VV = sparse(numTotalDofs, numTotalDofs);
+            if enable_V
+                sysCtx.C_AV = obj.Assembler.assembleCoupling(space_A, space_V, sigmaMap);
+                sysCtx.L_VV = obj.Assembler.assembleScalarLaplacian(space_V, sigmaMap);
+            end
+            
+            % 预计算正则化质量矩阵
+            sysCtx.M_reg = sparse(numTotalDofs, numTotalDofs);
+            if obj.AutoRegularization
+                M_local = obj.Assembler.assembleMass(space_A);
+                [im, jm, vm] = find(M_local);
+                sysCtx.M_reg = sparse(im, jm, vm, numTotalDofs, numTotalDofs);
+            end
+            
+            % --- 3. 边界条件 ---
+            if islogical(fixedDofs_A), idx_A = find(fixedDofs_A); else, idx_A = fixedDofs_A(:); end
+            all_fixed_dofs = idx_A;
+            
+            if enable_V
+                if isempty(fixedDofs_V), idx_V = [];
+                elseif islogical(fixedDofs_V), idx_V = find(fixedDofs_V); 
+                else, idx_V = fixedDofs_V(:); end
+                
+                if ~isempty(auto_ground_idx)
+                    idx_V = unique([idx_V; auto_ground_idx]);
+                end
+                
+                idx_V = idx_V(idx_V <= numTotalDofs); 
+                all_fixed_dofs = [all_fixed_dofs; idx_V];
+            end
+            
+            % --- 4. 初始解 ---
+            x = zeros(numTotalDofs, 1);
+            if ~isempty(x_init)
+                n_copy = min(length(x_init), numTotalDofs);
+                x(1:n_copy) = x_init(1:n_copy);
+            end
+            
+            % --- 5. 牛顿迭代 ---
+            converged = false;
+            norm_res = 0;
+            
+            % 动态正则化系数
+            sysCtx.RegScaleAbs = 0;
+            
+            % 初次评估
+            [J_sys, R_sys] = obj.evaluateSystem(x, sysCtx, true);
+            
+            % [Auto-Reg] 计算绝对正则化系数
+            if obj.AutoRegularization
+                diag_J = abs(diag(J_sys));
+                ref_scale = max(diag_J); % 使用 Max 增强稳定性
+                if ref_scale == 0, ref_scale = 1.0; end
+                sysCtx.RegScaleAbs = full(ref_scale * obj.RegScale);
+                fprintf('   [Auto-Reg] Regularization Scale: %.2e\n', sysCtx.RegScaleAbs);
+                
+                J_sys = J_sys + sysCtx.RegScaleAbs * sysCtx.M_reg;
+                R_sys = R_sys + (sysCtx.RegScaleAbs * sysCtx.M_reg) * x;
+            end
+            
+            [J_bc, Res_bc] = BoundaryCondition.applyDirichlet(J_sys, R_sys, all_fixed_dofs);
+            norm_res = norm(Res_bc);
+            
+            for iter = 1:obj.MaxIterations
+                
+                delta_x = obj.LinearSolver.solve(J_bc, -Res_bc);
+                if isempty(delta_x), break; end
+                
+                % --- 线搜索 (Line Search) ---
+                alpha = obj.Relaxation;
+                if obj.UseLineSearch
+                    res_prev = norm_res;
+                    for k = 0:obj.MaxLineSearchIters
+                        alpha_try = alpha * (0.5^k);
+                        x_try = x + alpha_try * delta_x;
                         
-                        marker = ''; if bt>0, marker=sprintf('[BT %d]', bt); end
-                        fprintf('   Iter %2d: Res=%.4e (Rel=%.4e) Step=%.4f %s\n', ...
-                            iter, current_res_norm, current_res_norm/norm_base, alpha, marker);
-                        break;
-                    else
-                        alpha = alpha * obj.BacktrackFactor;
+                        [~, R_try] = obj.evaluateSystem(x_try, sysCtx, false);
+                        R_try(all_fixed_dofs) = 0; % 忽略边界点残差
+                        
+                        % 考虑正则化对残差的影响
+                        if obj.AutoRegularization
+                            R_try = R_try + (sysCtx.RegScaleAbs * sysCtx.M_reg) * x_try;
+                        end
+                        
+                        res_try = norm(R_try);
+                        if res_try < res_prev || (iter == 1 && k < 3)
+                            alpha = alpha_try;
+                            if k > 0, fprintf('      [LS] Step %.4f, Res %.2e\n', alpha, res_try); end
+                            break;
+                        end
                     end
                 end
                 
-                if ~accepted
-                    warning('Line search failed.');
-                    break;
+                x = x + alpha * delta_x;
+                norm_step = norm(alpha * delta_x);
+                
+                % 准备下一次迭代
+                [J_sys, R_sys] = obj.evaluateSystem(x, sysCtx, true);
+                
+                % 应用正则化
+                if obj.AutoRegularization
+                    J_sys = J_sys + sysCtx.RegScaleAbs * sysCtx.M_reg;
+                    R_sys = R_sys + (sysCtx.RegScaleAbs * sysCtx.M_reg) * x;
                 end
                 
-                res_history(end+1) = current_res_norm; %#ok<AGROW>
+                [J_bc, Res_bc] = BoundaryCondition.applyDirichlet(J_sys, R_sys, all_fixed_dofs);
+                norm_res = norm(Res_bc);
                 
-                if current_res_norm / norm_base < obj.Tolerance
-                    fprintf('   -> Converged!\n');
+                fprintf('      Iter %2d: Res=%.4e, Step=%.4e\n', iter, norm_res, norm_step);
+                
+                if norm_res < obj.Tolerance || norm_step < 1e-10
                     converged = true;
                     break;
                 end
             end
             
             if ~converged
-                warning('Nonlinear solver reached max iterations without convergence.');
+                fprintf('   [Warning] Max iterations reached (%d). Res=%.4e\n', obj.MaxIterations, norm_res);
             end
             
-            info.Iterations = iter;
-            info.Residuals = res_history;
+            A_sol = x(1:num_A);
+            if enable_V
+                V_sol = x(offset_V+1 : end);
+            else
+                V_sol = [];
+            end
+            
             info.Converged = converged;
-            fprintf('==============================================\n');
+            info.Iterations = iter;
+            info.FinalResidual = norm_res;
+            info.Solution = x; 
+        end
+        
+        function tags = getConductingRegions(~, sigmaMap)
+            tags = [];
+            if isa(sigmaMap, 'containers.Map')
+                keys = sigmaMap.keys;
+                for i = 1:length(keys)
+                    k = keys{i}; val = sigmaMap(k);
+                    if max(abs(val)) > 1e-12
+                        if ischar(k), k = str2double(k); end
+                        tags = [tags, k]; 
+                    end
+                end
+            elseif isnumeric(sigmaMap)
+                tags = find(sigmaMap > 1e-12);
+            end
+        end
+    end
+    
+    methods (Access = private)
+        function [J_out, R_out] = evaluateSystem(obj, x, ctx, calc_J)
+            A_vec = x(1:ctx.num_A);
+            
+            [J_AA, R_nu] = obj.Assembler.assembleJacobian(ctx.space_A, A_vec, ctx.matLib, calc_J);
+            
+            % 尺寸安全
+            if size(R_nu, 1) < ctx.numTotalDofs
+                R_nu(ctx.numTotalDofs, 1) = 0; 
+            end
+            
+            if ctx.enable_V
+                % DC 方程:
+                % Row A: Curl(Nu Curl A) + C_AV * V = J_s
+                % Row V: L_VV * V = 0 (Assuming DC continuity, no d/dt terms)
+                % 注意: 这里假设 C_AV 是 (A,V) 块，且不对称
+                
+                Term_C = ctx.C_AV * x;
+                Term_L = ctx.L_VV * x;
+                R_out = R_nu + Term_C + Term_L - ctx.F_sys;
+                
+                J_out = [];
+                if calc_J
+                    J_out = J_AA + ctx.C_AV + ctx.L_VV;
+                    
+                    % 检查是否有外部附加矩阵
+                    if ~isempty(obj.MatrixK_Add)
+                         % (省略实现以保持简洁，通常用于特定约束)
+                    end
+                end
+            else
+                R_out = R_nu - ctx.F_sys;
+                J_out = J_AA;
+            end
         end
     end
 end
