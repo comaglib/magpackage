@@ -1,6 +1,6 @@
 /**
- * assemble_jacobian_kernel_mex.cpp (Update for V7 Utils)
- * 功能: 适配新的 MexMaterialUtils 构造函数 (接收 explicit coe_start)
+ * assemble_jacobian_kernel_mex.cpp
+ * 功能: 适配 MexElemUtils.hpp 接口 (Mat3x3 & compute_jacobian_3d)
  */
 
 #include "mex.h"
@@ -8,12 +8,12 @@
 #include <cmath>
 #include <vector>
 #include "MexElemUtils.hpp"
-#include "MexMaterialUtils.hpp"
+#include "MexMaterialUtils.hpp" 
 
 void mexFunction(int nlhs, mxArray *plhs[], int nrhs, const mxArray *prhs[])
 {
-    // Updated Expected Args: 18 inputs (Added M_coe_start at index 15)
-    if (nrhs != 18) mexErrMsgIdAndTxt("MagPackage:Args", "Expected 18 inputs.");
+    // Expected Args: 16 inputs
+    if (nrhs != 16) mexErrMsgIdAndTxt("MagPackage:Args", "Expected 16 inputs.");
 
     double* P = mxGetPr(prhs[0]);
     double* T = mxGetPr(prhs[1]);
@@ -31,26 +31,29 @@ void mexFunction(int nlhs, mxArray *plhs[], int nrhs, const mxArray *prhs[])
     double* M_coe = mxGetPr(prhs[12]);
     double* M_start = mxGetPr(prhs[13]);
     double* M_cnt = mxGetPr(prhs[14]);
-    double* M_coe_start = mxGetPr(prhs[15]); // NEW input
-    
-    double  TimeStep = mxGetScalar(prhs[16]); 
-    bool    CalcJ = (mxGetScalar(prhs[17]) > 0.5);
+
+    bool CalcJ = (bool)mxGetScalar(prhs[15]);
 
     size_t numElems = mxGetN(prhs[1]);
-    size_t numQP = mxGetNumberOfElements(prhs[6]);
-    int maxTag = (int)mxGetNumberOfElements(prhs[8]) - 1;
+    size_t n_q = mxGetM(prhs[6]) * mxGetN(prhs[6]);
 
-    // Use new constructor
-    MaterialEvaluator matEval(M_lin, M_isNon, M_maxB, M_brk, M_coe, M_start, M_cnt, M_coe_start, maxTag);
+    MexMaterialData matData;
+    matData.linearNu = M_lin;
+    matData.isNonlinear = M_isNon;
+    matData.maxBSq = M_maxB;
+    matData.breaks = M_brk;
+    matData.coefs = M_coe;
+    matData.splineStart = M_start;
+    matData.splineCount = M_cnt;
 
-    size_t numJ = CalcJ ? (numElems * 36) : 0;
-    size_t numR = numElems * 6;
-
-    plhs[0] = mxCreateDoubleMatrix(numJ, 1, mxREAL); 
-    plhs[1] = mxCreateDoubleMatrix(numJ, 1, mxREAL); 
-    plhs[2] = mxCreateDoubleMatrix(numJ, 1, mxREAL); 
-    plhs[3] = mxCreateDoubleMatrix(numR, 1, mxREAL); 
-    plhs[4] = mxCreateDoubleMatrix(numR, 1, mxREAL); 
+    // Outputs
+    size_t nnz = CalcJ ? (numElems * 36) : 0;
+    
+    plhs[0] = mxCreateDoubleMatrix(nnz, 1, mxREAL); // I
+    plhs[1] = mxCreateDoubleMatrix(nnz, 1, mxREAL); // J
+    plhs[2] = mxCreateDoubleMatrix(nnz, 1, mxREAL); // V
+    plhs[3] = mxCreateDoubleMatrix(numElems * 6, 1, mxREAL); // R_idx
+    plhs[4] = mxCreateDoubleMatrix(numElems * 6, 1, mxREAL); // R_val
 
     double* I_out = mxGetPr(plhs[0]);
     double* J_out = mxGetPr(plhs[1]);
@@ -58,75 +61,82 @@ void mexFunction(int nlhs, mxArray *plhs[], int nrhs, const mxArray *prhs[])
     double* R_idx = mxGetPr(plhs[3]);
     double* R_val = mxGetPr(plhs[4]);
 
-    #pragma omp parallel for
-    for (long e = 0; e < numElems; e++) {
-        double p_local[12];
-        for (int n = 0; n < 4; n++) {
-            long node_idx = (long)T[n + e*4] - 1; 
-            p_local[n*3 + 0] = P[node_idx*3 + 0];
-            p_local[n*3 + 1] = P[node_idx*3 + 1];
-            p_local[n*3 + 2] = P[node_idx*3 + 2];
+    #pragma omp parallel for schedule(static)
+    for (size_t e = 0; e < numElems; e++) {
+        // Fetch Element Nodes
+        double nodes[4][3];
+        for (int i = 0; i < 4; i++) {
+            int nid = (int)T[i + e*4] - 1;
+            nodes[i][0] = P[nid*3 + 0];
+            nodes[i][1] = P[nid*3 + 1];
+            nodes[i][2] = P[nid*3 + 2];
         }
 
+        // [Modified] Use MexElemUtils interface
         Mat3x3 J_mat;
-        double detJ = MexElemUtils::compute_jacobian_3d(p_local, J_mat);
+        double detJ = MexElemUtils::compute_jacobian_3d(&nodes[0][0], J_mat);
+        
         double absDetJ = std::abs(detJ);
         double invDetJ = 1.0 / detJ;
 
+        // Fetch Dofs & Signs
+        int dofs[6];
         double signs[6];
-        long dofs[6];
-        double a_local[6];
-
-        for(int k=0; k<6; k++) {
-            signs[k] = Signs[k + e*6];
-            dofs[k] = (long)Dofs[k + e*6];
-            long global_idx = dofs[k] - 1;
-            if (global_idx >= 0) {
-                a_local[k] = SolA[global_idx] * signs[k];
-            } else {
-                a_local[k] = 0.0;
-            }
+        double A_local[6];
+        for (int i = 0; i < 6; i++) {
+            dofs[i] = (int)Dofs[i + e*6];
+            signs[i] = Signs[i + e*6];
+            int gid = dofs[i] - 1; 
+            if (gid >= 0) A_local[i] = SolA[gid] * signs[i];
+            else          A_local[i] = 0.0;
         }
 
+        double CurlNi[6][3];
+        double R_local[6] = {0};
         double K_local[6][6] = {0};
-        double R_local[6]    = {0};
         int tag = (int)Tags[e];
 
-        for (int q = 0; q < numQP; q++) {
-            double w = Qw[q] * absDetJ; 
-            long q_offset = q * 18;
-
-            double B[3] = {0, 0, 0};
-            double CurlNi[6][3]; 
-
+        for (size_t q = 0; q < n_q; q++) {
+            double w = Qw[q] * absDetJ;
+            
             for (int i = 0; i < 6; i++) {
-                double ref_c[3];
-                ref_c[0] = RefCurl[i + 0  + q_offset];
-                ref_c[1] = RefCurl[i + 6  + q_offset];
-                ref_c[2] = RefCurl[i + 12 + q_offset];
-                double temp[3];
-                J_mat.multVec(ref_c, temp);
-                CurlNi[i][0] = temp[0] * invDetJ;
-                CurlNi[i][1] = temp[1] * invDetJ;
-                CurlNi[i][2] = temp[2] * invDetJ;
-                B[0] += a_local[i] * CurlNi[i][0];
-                B[1] += a_local[i] * CurlNi[i][1];
-                B[2] += a_local[i] * CurlNi[i][2];
+                double c_ref[3];
+                c_ref[0] = RefCurl[i + 0*6 + q*18];
+                c_ref[1] = RefCurl[i + 1*6 + q*18];
+                c_ref[2] = RefCurl[i + 2*6 + q*18];
+
+                // [Modified] Use Mat3x3::multVec for Piola transform (numerator)
+                // Curl = (1/detJ) * J * Curl_ref
+                double c_phy[3];
+                J_mat.multVec(c_ref, c_phy);
+
+                CurlNi[i][0] = c_phy[0] * invDetJ;
+                CurlNi[i][1] = c_phy[1] * invDetJ;
+                CurlNi[i][2] = c_phy[2] * invDetJ;
             }
 
+            double B[3] = {0, 0, 0};
+            for (int i = 0; i < 6; i++) {
+                B[0] += A_local[i] * CurlNi[i][0];
+                B[1] += A_local[i] * CurlNi[i][1];
+                B[2] += A_local[i] * CurlNi[i][2];
+            }
             double B_sq = B[0]*B[0] + B[1]*B[1] + B[2]*B[2];
-            double dnu = 0.0;
-            double nu = matEval.evaluate(tag, B_sq, dnu);
+
+            double nu, dnu;
+            evaluate_nu_derivative(B_sq, tag, matData, nu, dnu);
             
             for (int i = 0; i < 6; i++) {
                 double B_dot_Ci = B[0]*CurlNi[i][0] + B[1]*CurlNi[i][1] + B[2]*CurlNi[i][2];
                 R_local[i] += nu * B_dot_Ci * w;
+                
                 if (CalcJ) {
                     for (int j = 0; j < 6; j++) {
                         double Ci_dot_Cj = CurlNi[i][0]*CurlNi[j][0] + 
                                            CurlNi[i][1]*CurlNi[j][1] + 
                                            CurlNi[i][2]*CurlNi[j][2];
                         double B_dot_Cj = B[0]*CurlNi[j][0] + B[1]*CurlNi[j][1] + B[2]*CurlNi[j][2];
+                        
                         double val = nu * Ci_dot_Cj + 2.0 * dnu * B_dot_Ci * B_dot_Cj;
                         K_local[i][j] += val * w;
                     }
@@ -137,18 +147,18 @@ void mexFunction(int nlhs, mxArray *plhs[], int nrhs, const mxArray *prhs[])
         long r_base = e * 6;
         for (int i = 0; i < 6; i++) {
             R_idx[r_base + i] = (double)dofs[i];
-            R_val[r_base + i] = R_local[i] * signs[i];
+            R_val[r_base + i] = R_local[i] * signs[i]; 
         }
 
         if (CalcJ) {
-            long j_base = e * 36;
-            int count = 0;
-            for (int c = 0; c < 6; c++) {
-                for (int r = 0; r < 6; r++) {
-                    I_out[j_base + count] = (double)dofs[r];
-                    J_out[j_base + count] = (double)dofs[c];
-                    V_out[j_base + count] = K_local[r][c] * signs[r] * signs[c];
-                    count++;
+            long k_base = e * 36;
+            int idx = 0;
+            for (int j = 0; j < 6; j++) {
+                for (int i = 0; i < 6; i++) {
+                    I_out[k_base + idx] = (double)dofs[i];
+                    J_out[k_base + idx] = (double)dofs[j];
+                    V_out[k_base + idx] = K_local[i][j] * signs[i] * signs[j];
+                    idx++;
                 }
             }
         }

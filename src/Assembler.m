@@ -159,12 +159,12 @@ classdef Assembler < handle
                     [q_pts, q_w] = get_quadrature_data('tet', order);
                     [~, curl_ref] = nedelec_tet_p1(q_pts);
                     
-                    [m_lin, m_isNon, m_maxB, m_brk, m_coe, m_start, m_cnt, m_coe_start] = obj.packMaterialData(matLibData);
+                    [m_lin, m_isNon, m_maxB, m_brk, m_coe, m_start, m_cnt] = obj.packMaterialData(matLibData);
                     
                     [I, J, V, R_idx, R_val] = assemble_jacobian_kernel_mex(...
                         packedData.P, double(packedData.T), double(packedData.CellDofs), double(packedData.Signs), ...
                         double(packedData.RegionTags), solutionA, q_w, curl_ref, ...
-                        m_lin, m_isNon, m_maxB, m_brk, m_coe, m_start, m_cnt, m_coe_start, 0, double(calcJ));
+                        m_lin, m_isNon, m_maxB, m_brk, m_coe, m_start, m_cnt, double(calcJ));
                     
                     if calcJ
                         valid = (I > 0) & (J > 0); 
@@ -202,53 +202,68 @@ classdef Assembler < handle
             
             if strcmpi(space.Type, 'Nedelec')
                 if exist('assemble_hbfem_kernel_mex', 'file') == 3
+                    % === MEX Path (Complex Fixed) ===
                     order = max(obj.Config.DefaultQuadratureOrder, 2);
                     [q_pts, q_w] = get_quadrature_data('tet', order);
                     [~, curl_ref] = nedelec_tet_p1(q_pts);
                     
-                    H_vec = aftObj.Harmonics; 
-                    Scalings = ones(length(H_vec), 1); 
+                    H_vec = aftObj.Harmonics;
+                    Scalings = ones(length(H_vec), 1);
                     Scalings(H_vec > 0) = 2.0; 
                     
-                    [m_lin, m_isNon, m_maxB, m_brk, m_coe, m_start, m_cnt, m_coe_start] = obj.packMaterialData(matLibData);
+                    [m_lin, m_isNon, m_maxB, m_brk, m_coe, m_start, m_cnt] = ...
+                        obj.packMaterialData(matLibData);
                     
-                    solH_full = full(solHarmonics); 
+                    % 拆分复数输入
+                    solH_full = full(solHarmonics);
                     SolH_R = real(solH_full); SolH_I = imag(solH_full);
-                    Dmat_R = real(aftObj.D_matrix); Dmat_I = imag(aftObj.D_matrix); 
+                    
+                    Dmat_R = real(aftObj.D_matrix); Dmat_I = imag(aftObj.D_matrix);
                     Pmat_R = real(aftObj.P_matrix); Pmat_I = imag(aftObj.P_matrix);
                     
+                    % 调用 MEX (22 输入)
                     [I, J, V, R_rows, R_cols, R_val_R, R_val_I] = assemble_hbfem_kernel_mex(...
-                        packedData.P, double(packedData.T), double(packedData.CellDofs), double(packedData.Signs), ...
-                        double(packedData.RegionTags), SolH_R, SolH_I, Dmat_R, Dmat_I, Pmat_R, Pmat_I, ...
-                        q_w, curl_ref, m_lin, m_isNon, m_maxB, m_brk, m_coe, m_start, m_cnt, m_coe_start, ...
-                        0, double(calcJ), Scalings);
+                        packedData.P, ...
+                        double(packedData.T), ...
+                        double(packedData.CellDofs), ...
+                        double(packedData.Signs), ...
+                        double(packedData.RegionTags), ...
+                        SolH_R, SolH_I, ... % Split Sol
+                        Dmat_R, Dmat_I, ... % Split Dmat
+                        Pmat_R, Pmat_I, ... % Split Pmat
+                        q_w, curl_ref, ...
+                        m_lin, m_isNon, m_maxB, m_brk, m_coe, m_start, m_cnt, ...
+                        double(calcJ), ...
+                        Scalings);
                     
                     if calcJ
-                        valid = (I > 0) & (J > 0); 
-                        J_triplets.I = I(valid); J_triplets.J = J(valid); J_triplets.V = V(valid); 
+                        % J 矩阵通常是实部近似 (Block Diagonal)，但如果是 full Newton 可能也是复数
+                        % 当前 MEX 实现只返回实部 J (nu_dc 近似)，所以不需要 imag
+                        J_triplets.I = I; J_triplets.J = J; J_triplets.V = V;
                     else
-                        J_triplets = []; 
+                        J_triplets = [];
                     end
                     
                     if isempty(R_rows)
-                        Res_mat = sparse(obj.DofHandler.NumGlobalDofs, aftObj.NumHarmonics); 
+                        Res_mat = sparse(obj.DofHandler.NumGlobalDofs, aftObj.NumHarmonics);
                     else
-                        valid_r = (R_rows > 0) & (R_cols > 0); 
-                        R_val_Complex = complex(R_val_R, R_val_I); 
-                        Res_mat = sparse(R_rows(valid_r), R_cols(valid_r), R_val_Complex(valid_r), obj.DofHandler.NumGlobalDofs, aftObj.NumHarmonics); 
+                        % 重建复数残差
+                        R_val_Complex = complex(R_val_R, R_val_I);
+                        Res_mat = sparse(R_rows, R_cols, R_val_Complex, obj.DofHandler.NumGlobalDofs, aftObj.NumHarmonics);
                     end
+                    
                 else
+                    % === MATLAB Path ===
                     [I, J, V, R_mat] = assemble_hbfem_kernel(packedData, solHarmonics, aftObj, matLibData, obj.Config, calcJ);
                     if calcJ
-                        valid = (I > 0) & (J > 0); 
-                        J_triplets.I = I(valid); J_triplets.J = J(valid); J_triplets.V = V(valid); 
+                        J_triplets.I = I; J_triplets.J = J; J_triplets.V = V;
                     else
-                        J_triplets = []; 
+                        J_triplets = [];
                     end
                     Res_mat = R_mat;
                 end
             else
-                error('Unsupported space type.');
+                error('Unsupported space.');
             end
         end
         
