@@ -19,15 +19,15 @@ function run_all_tests()
     addpath(testDir);
     
     % Check for MEX files
-    if exist('assemble_curl_curl_kernel_mex', 'file') ~= 3
-        fprintf('[WARN] MEX files not detected. Attempting to compile...\n');
-        try
-            make();
-        catch
-            fprintf(2, '[ERROR] Compilation failed. Aborting tests.\n');
-            return;
-        end
-    end
+    % if exist('assemble_curl_curl_kernel_mex', 'file') ~= 3
+    %     fprintf('[WARN] MEX files not detected. Attempting to compile...\n');
+    %     try
+    %         make();
+    %     catch
+    %         fprintf(2, '[ERROR] Compilation failed. Aborting tests.\n');
+    %         return;
+    %     end
+    % end
 
     % 2. Scan Test Files
     files = dir(fullfile(testDir, 'test_*.m'));

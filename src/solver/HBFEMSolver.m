@@ -96,7 +96,7 @@ classdef HBFEMSolver < handle
             if nargin < 6 || isempty(x0)
                 X_mat = zeros(totalDofs, 1);
             else
-                X_mat = x0;
+                X_mat = reshape(x0, totalDofs, 1);
             end
             
             converged = false;

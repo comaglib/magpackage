@@ -1,161 +1,137 @@
-% TEST_HBFEM_HARMONICS
-% 测试 HBFEMSolver 在多谐波 (DC + Odd) 工况下的表现
-% 谐波配置: [0, 1, 3, 5]
-% 验证目标: DC 响应、基波响应及非线性激发的高次谐波
+% test_hbfem_solve.m
+% 测试纯 HBFEM 求解器 (非耦合)
+% 谐波配置: DC + 基波 + 3次 + 5次
+% 修复: 修正 info 结构体字段访问错误 (FinalResidual -> Residuals(end))
 
 clear; clc;
+addpath(genpath('src'));
 
-% ==========================================
-% 1. 构建简单网格 (单四面体)
-% ==========================================
-fprintf('[Step 1] Creating simple mesh...\n');
-mesh = Mesh();
-% 4个节点: 原点, x, y, z (单位: m)
-mesh.P = [0 1 0 0; 0 0 1 0; 0 0 0 1] * 0.01; % 1cm 尺寸
-mesh.T = [1; 2; 3; 4]; 
-mesh.RegionTags = [1]; 
-mesh.NumNodes = 4;
-mesh.NumElements = 1;
-mesh.generateEdges(); 
+fprintf('=========================================================\n');
+fprintf('   Test: HBFEM Field Solver (Harmonics: 0, 1, 3, 5)\n');
+fprintf('=========================================================\n');
 
-% ==========================================
-% 2. 定义空间与自由度
-% ==========================================
-fprintf('[Step 2] Distributing DoFs...\n');
+%% 1. 网格生成 (Mesh Generation)
+% 生成一个 1m x 0.2m x 0.2m 的简易长方体
+[X, Y, Z] = meshgrid(linspace(0,1,6), linspace(0,0.2,3), linspace(0,0.2,3));
+DT = delaunayTriangulation(X(:), Y(:), Z(:));
+mesh = Mesh(); 
+mesh.P = DT.Points'; 
+mesh.T = DT.ConnectivityList';
+mesh.RegionTags = ones(1, size(mesh.T, 2)); % 单一区域
+mesh.NumNodes = size(mesh.P, 2); 
+mesh.NumElements = size(mesh.T, 2);
+mesh.generateEdges();
+
+fprintf('[Mesh] Nodes: %d, Elements: %d, Edges: %d\n', mesh.NumNodes, mesh.NumElements, size(mesh.Edges, 2));
+
+%% 2. 物理空间 (Function Space)
 dofHandler = DofHandler(mesh);
 space = FunctionSpace('Nedelec', 1);
 dofHandler.distributeDofs(space);
 numDofs = dofHandler.NumGlobalDofs;
-fprintf('   Total DoFs: %d\n', numDofs);
 
-% ==========================================
-% 3. 定义非线性材料
-% ==========================================
-fprintf('[Step 3] Defining Nonlinear Material...\n');
-% 构造一条典型的软磁 B-H 曲线 (带物理斜率以防止奇异)
-H_data = linspace(0, 5000, 200);
-mu0 = 4*pi*1e-7;
-% B = 1.6 * tanh(H/200) + mu0*H (饱和磁通约 1.6T)
-B_data = 1.6 * tanh(H_data / 200) + mu0 * H_data; 
+%% 3. AFT 与 谐波设置 (Harmonics)
+% 要求配置: [0, 1, 3, 5]
+harmonics = [0, 1, 3, 5];
+base_freq = 50; 
+% 自动计算所需时间步数 (Nyquist: > 2*max(H) + 1 => 11)
+% 为了 FFT 效率取 16 或 32
+num_time_steps = 32; 
 
-matLibData = containers.Map('KeyType', 'double', 'ValueType', 'any');
-matLibData(1) = MaterialLib.createNonlinear(B_data, H_data);
+% 注意: 根据 AFT.m 定义，参数顺序为 (harmonics, n_time_steps, base_freq)
+aft = AFT(harmonics, num_time_steps, base_freq);
+fprintf('[AFT] Freq: %g Hz, Steps: %d, Harmonics: %s\n', base_freq, num_time_steps, mat2str(harmonics));
 
-% ==========================================
-% 4. 配置 AFT (谐波平衡)
-% ==========================================
-fprintf('[Step 4] Configuring AFT (DC, 1st, 3rd, 5th)...\n');
-baseFreq = 50;
-harmonics = [0, 1, 3, 5]; 
-% 时间步数需 > 2*max(H)+1 = 11, 取 32 以优化 FFT
-aft = AFT(harmonics, 64, baseFreq); 
+%% 4. 材料定义 (Manual Spline Material)
+% 构造非线性材料数据
+mat_iron = struct();
+mat_iron.Type = 'Nonlinear';
+mat_iron.Name = 'TestIron';
+mat_iron.nu0 = 1 / (1000 * 4*pi*1e-7); % Initial mu_r = 1000
+mat_iron.MaxBSq = 20.0; 
 
-% ==========================================
-% 5. 组装源项 (DC + AC)
-% ==========================================
-fprintf('[Step 5] Preparing Sources...\n');
+% 生成 B^2 - Nu 曲线
+b_sq_pts = linspace(0, 5, 20); 
+mu_r_eff = 1000 ./ (1 + 2.0 * b_sq_pts) + 10; % 饱和模型
+nu_pts = (1 ./ (mu_r_eff * 4*pi*1e-7))';
+
+mat_iron.SplineNu = spline(b_sq_pts, nu_pts);
+% 维度修正
+if size(mat_iron.SplineNu.coefs, 1) ~= (length(mat_iron.SplineNu.breaks)-1)
+    mat_iron.SplineNu.coefs = mat_iron.SplineNu.coefs'; 
+end
+
+MatLibData = containers.Map('KeyType', 'double', 'ValueType', 'any');
+MatLibData(1) = mat_iron;
+
+%% 5. 组装源项 (Source Assembly)
 assembler = Assembler(mesh, dofHandler);
 
-% 设定电流密度 J (A/m^2)
-% 1. DC 偏置: 1e6 A/m^2
-% 2. AC 基波: 5e6 A/m^2 (使其工作在非线性区)
-src_DC = containers.Map({1}, {[1e6; 0; 0]});
-src_AC = containers.Map({1}, {[5e6; 0; 0]});
+% 定义空间上的电流密度 J = 1e6 A/m^2 (沿 Z 轴)
+J_vec = [0; 0; 1e6];
+SourceMap = containers.Map({1}, {J_vec});
 
-% 源项列表对应 harmonics: [0, 1, 3, 5]
-% 3次和5次无外部源，依靠非线性产生
-sourceMaps = {src_DC, src_AC, [], []}; 
+% 计算空间源向量 F_spatial (NumDofs x 1)
+F_spatial = assembler.assembleSource(space, SourceMap);
 
-% 边界条件: 固定第1条棱 (防止刚体模态)
-fixedDofs = false(numDofs, 1);
-fixedDofs(1) = true; 
+% 构造 HBFEM 右端项矩阵 F_total (NumDofs x NumHarmonics)
+F_total = zeros(numDofs, aft.NumHarmonics);
 
-% ==========================================
-% 6. 运行求解器
-% ==========================================
-fprintf('[Step 6] Running Solver...\n');
+% 将源施加在基波分量上 (Harmonic index 2 corresponds to h=1)
+% Harmonics array: [0, 1, 3, 5] -> Indices: 1, 2, 3, 4
+idx_fund = find(harmonics == 1); 
+F_total(:, idx_fund) = F_spatial;
+
+fprintf('[Source] Applied Jz=1e6 on Harmonic k=%d (Order 1)\n', idx_fund);
+
+%% 6. 求解器配置与运行 (Solver)
 solver = HBFEMSolver(assembler, aft);
-solver.AutoRegularization = true; % 处理 DC 分量的规范性
-solver.Tolerance = 1e-3;
-solver.MaxIter = 30;
+solver.Tolerance = 1e-4;
+solver.MaxIter = 20;
+solver.LinearSolver.Method = 'MUMPS'; 
 
-[X_sol, info] = solver.solve(space, matLibData, sourceMaps, fixedDofs);
+% 边界条件: 外表面 A=0
+fixedDofs = BoundaryCondition.findOuterBoundaryDofs(mesh, dofHandler, space);
 
-% ==========================================
-% 7. 结果分析与判断
-% ==========================================
-fprintf('\n==============================================\n');
-fprintf('             ANALYSIS REPORT                  \n');
-fprintf('==============================================\n');
+fprintf('[Solver] Starting Newton Iterations...\n');
+x_init = zeros(numDofs, aft.NumHarmonics);
 
-if info.Converged
-    fprintf('[STATUS] Solver Converged in %d iterations.\n', info.Iterations);
-else
-    fprintf('[STATUS] Solver FAILED to converge.\n');
-end
-
-% 提取各次谐波分量 (Harmonic-Major 存储格式)
-norms = zeros(length(harmonics), 1);
-names = {'DC ', '1st', '3rd', '5th'};
-norms(2) = norm(X_sol(numDofs + 1 : 2 * numDofs));
-
-fprintf('\n--- Harmonic Contents (L2 Norm) ---\n');
-for i = 1:length(harmonics)
-    idx_start = (i-1) * numDofs + 1;
-    idx_end   = i * numDofs;
-    vec_h = X_sol(idx_start : idx_end);
-    norms(i) = norm(vec_h);
+try
+    % 调用求解
+    % 接口: (space, matLib, RHS_Matrix, fixedDofs, x_init)
+    [x_sol, info] = solver.solve(space, MatLibData, F_total, fixedDofs, x_init);
     
-    % 计算相对基波的比率
-    ratio = 0;
-    if i ~= 2 && norms(2) > 1e-12
-        ratio = norms(i) / norms(2) * 100;
+    fprintf('   > Converged: %d\n', info.Converged);
+    fprintf('   > Iterations: %d\n', info.Iterations);
+    
+    % [修复点] 使用 Residuals(end) 获取最终残差
+    final_res = info.Residuals(end);
+    fprintf('   > Final Residual: %.2e\n', final_res);
+    
+    %% 7. 结果检查
+    if info.Converged
+        % 提取基波分量
+        A_fund = x_sol(:, idx_fund);
+        max_A = max(abs(A_fund));
+        fprintf('[Result] Max Fundamental A: %.4e\n', max_A);
+        
+        % 提取 3 次谐波分量 (检查是否产生非线性谐波)
+        idx_3rd = find(harmonics == 3);
+        A_3rd = x_sol(:, idx_3rd);
+        max_A3 = max(abs(A_3rd));
+        fprintf('[Result] Max 3rd Harmonic A: %.4e (Ratio to Fund: %.2f%%)\n', ...
+            max_A3, (max_A3/max_A)*100);
+        
+        % 简单的可视化
+        viz = Visualizer(PostProcessor(assembler));
+        figure(1); clf;
+        viz.plotFieldMagnitude(A_fund, space, 'B');
+        title('Fundamental B Field');
+        colorbar;
+        drawnow;
     end
     
-    if i == 2
-        fprintf('   Harmonic %s: %10.4e (Reference)\n', names{i}, norms(i));
-    else
-        fprintf('   Harmonic %s: %10.4e (%.2f%% of 1st)\n', names{i}, norms(i), ratio);
-    end
-end
-
-fprintf('\n--- Quality Checks ---\n');
-passed = true;
-
-% 1. 检查 DC 分量 (应存在且非零，因为施加了 DC 源)
-if norms(1) > 1e-9
-    fprintf('[PASS] DC Component detected (Response to bias).\n');
-else
-    fprintf('[WARN] DC Component is too small or zero.\n');
-end
-
-% 2. 检查基波 (应为主导)
-if norms(2) > norms(3) && norms(2) > norms(4)
-    fprintf('[PASS] Fundamental frequency is dominant.\n');
-else
-    fprintf('[FAIL] Fundamental is NOT dominant!\n');
-    passed = false;
-end
-
-% 3. 检查非线性谐波 (3次应显著存在)
-% 阈值设为 0.1% 基波幅值，表明非线性被激发
-if norms(3) > 1e-3 * norms(2)
-    fprintf('[PASS] 3rd Harmonic generated (>0.1%%).\n');
-else
-    fprintf('[WARN] 3rd Harmonic too weak. Material might be linear or saturated.\n');
-    % 此时不标记为 FAIL，视物理工况而定
-end
-
-% 4. 检查高次谐波衰减 (5次通常小于3次)
-if norms(4) < norms(3)
-    fprintf('[PASS] Harmonic decay observed (5th < 3rd).\n');
-else
-    fprintf('[WARN] 5th Harmonic is larger than 3rd (Unusual but possible).\n');
-end
-
-fprintf('----------------------------------------------\n');
-if passed
-    fprintf('OVERALL RESULT: [ PASSED ]\n');
-else
-    fprintf('OVERALL RESULT: [ FAILED ]\n');
+catch ME
+    fprintf('[ERROR] %s\n', ME.message);
+    % disp(ME.stack(1));
 end

@@ -44,12 +44,6 @@ assembler = Assembler(mesh, dofHandler);
 % [Update] 构造函数调用更新，传入 L
 solver = HBFEMCoupledSolver(assembler, aft, coil, R_circuit, L_circuit);
 
-% [Removed] 移除了手动正则化代码，现在由 Solver 内部自动处理
-% M = assembler.assembleMass(space);
-% temp_MatMap = 1/mu0;
-% K_lin = ...
-% solver.MatrixK_Add = ... 
-
 % [Optimization] 调整求解参数以应对强饱和
 solver.MaxIter = 100;      % 增加迭代步数
 solver.Tolerance = 1e-3;   % 放宽收敛容差
