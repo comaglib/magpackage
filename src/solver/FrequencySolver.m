@@ -39,7 +39,7 @@ classdef FrequencySolver < handle
         end
         
         function [A_sol, V_sol] = solve(obj, space_A, space_V, matLib, sigmaMap, sourceMap, fixedDofs_A, fixedDofs_V)
-            % (保持原有逻辑不变...)
+            
             if nargin < 8, fixedDofs_V = []; end
             
             omega = 2 * pi * obj.Frequency;
