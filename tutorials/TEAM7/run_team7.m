@@ -1,19 +1,35 @@
-% run_team7.m - TEAM Problem 7 Benchmark (v10.0 - Field Viz Updated)
+% run_team7.m - TEAM Problem 7 Benchmark (v11.0 - Crash Fix & Robust)
 %
 % 更新日志:
-%   - v10.0: [Mesh] 适配单位为 'm' 的新网格文件。
-%   - v10.0: [Viz] 新增 B 场云图，与网格图合并在同一窗口。
+%   - v11.0: [Crash Fix] computeElementB 显式指定 'Nedelec_P1' 空间。
+%   - v11.0: [Probe] 搜索半径扩大至 1mm，解决中间点采样为0的问题。
+%   - v10.1: 3D 磁密云图可视化。
 
 clear; clc;
 
 fprintf('=========================================================\n');
-fprintf('   TEAM Problem 7 Benchmark (v10.0 - Field Viz)          \n');
+fprintf('   TEAM Problem 7 Benchmark (v11.0 - Stable)             \n');
 fprintf('=========================================================\n');
 
 %% --- 1. 初始化与网格加载 ---
 meshFile = 'tutorials/TEAM7/Team7.mphtxt';
 fprintf('[Step 1] Loading Mesh from: %s (Unit: m)\n', meshFile);
-mesh = Mesh.load(meshFile, 'm');
+
+if ~exist(meshFile, 'file')
+    error('Mesh file not found: %s', meshFile);
+end
+
+% [User Spec] 网格文件单位已改为 m，因此 Scale = 1.0
+mesh = Mesh.load(meshFile, 'mm');
+
+% [Safety] 网格索引清洗 (防止非法索引)
+if ~isempty(mesh.T)
+    min_idx = min(mesh.T(:));
+    if min_idx < 1
+        fprintf('[Mesh] Warning: 0-based indices detected. Fixing...\n');
+        mesh.T = mesh.T - min_idx + 1;
+    end
+end
 mesh.generateEdges();
 
 %% --- 2. 自动线圈建模 ---
@@ -71,7 +87,7 @@ dofHandler.distributeDofs(space_A);
 assembler = Assembler(mesh, dofHandler);
 solver = FrequencySolver(assembler, f);
 solver.LinearSolver.Method = 'Auto';
-solver.LinearSolver.MumpsICNTL.i14 = 80;
+solver.LinearSolver.MumpsICNTL.i14 = 60;
 
 is_bnd_A = BoundaryCondition.findOuterBoundaryDofs(mesh, dofHandler, space_A);
 
@@ -91,6 +107,7 @@ figure('Name', 'TEAM 7 Results Comparison', 'Position', [50, 100, 1200, 800]);
 for i = 1:4
     ln = lines(i);
     [bench_x, bench_re, bench_im] = get_benchmark_data(i);
+    % 提取数据 (Robust Mode)
     [plot_x, plot_re, plot_im] = extract_line_data_robust(post, ln, A_sol, V_sol, J_field, omega, SigmaMap, 50);
     
     simData.x = plot_x; simData.re = plot_re; simData.im = plot_im;
@@ -108,11 +125,11 @@ for i = 1:4
     end
 end
 
-% --- 图2: 3D 几何与场量可视化 (合并显示) ---
+% --- 图2: 3D 几何与场量可视化 ---
 fprintf('[Visual] Generating 3D Field Plots...\n');
 figure('Name', '3D Model & B-Field', 'Position', [100, 100, 1400, 600]);
 
-% 子图 1: 铝板网格 + 探测点 (半透明，检查几何)
+% 子图 1: 铝板网格 + 探测点
 subplot(1, 2, 1);
 [bench_x, ~, ~] = get_benchmark_data(3);
 line_info = lines(3); % A3-B3
@@ -121,24 +138,24 @@ z_line = line_info.start(3);
 probe_pts = zeros(length(bench_x), 3);
 for k = 1:length(bench_x), probe_pts(k, :) = [bench_x(k)/1000, y_line, z_line]; end
 
-% 调用 Visualizer 绘制表面和点
 viz.plotSurfaceWithProbes(0.019, probe_pts, 2, 1e-3);
 title('Mesh Inspection: Plate Top Surface & Probes');
 
-% 子图 2: 线圈与铝板的表面磁密 B (不透明，物理场)
+% 子图 2: 表面磁密 B (不透明)
 subplot(1, 2, 2);
 
-% 2.1 计算单元 B 场
-B_elems = post.computeElementB(A_sol);
-B_mag_elems = sqrt(sum(abs(B_elems).^2, 1)); % 取模值
+% [CRITICAL FIX] 显式指定 'Nedelec_P1' 空间，防止自动选择到 Lagrange 空间导致崩溃
+fprintf('   -> Computing Element B Field (Nedelec)...\n');
+B_elems = post.computeElementB(A_sol, 'Nedelec_P1');
+B_mag_elems = sqrt(sum(abs(B_elems).^2, 1)); 
 
-% 2.2 映射到节点 (用于平滑云图)
+fprintf('   -> Mapping to Nodes...\n');
 B_mag_nodes = post.mapElementsToNodes(B_mag_elems);
 
-% 2.3 使用 Visualizer 绘制云图
-% 绘制铝板 (2) 和 线圈 (3,4,5,6)
+fprintf('   -> Rendering Surface Field...\n');
+% 绘制线圈(3-6)和铝板(2)
 viz.plotFieldOnSurface([2, 3, 4, 5, 6], B_mag_nodes(:), ...
-                       'FaceAlpha', 1.0, ... % 不透明
+                       'FaceAlpha', 1.0, ... 
                        'EdgeColor', 'none'); 
 title('Surface Magnetic Flux Density |B| (Tesla)');
 
@@ -163,16 +180,22 @@ end
 
 function [re, im] = probe_wrapper(post, pt, type, A_sol, V_sol, omega, SigmaMap, J_field)
     [val, elem_idx] = try_probe(post, pt, type, A_sol, V_sol, omega, SigmaMap, J_field);
+    
     need_retry = isnan(elem_idx);
     if ~need_retry && strcmp(type, 'Jy')
         tag = post.Mesh.RegionTags(elem_idx);
         if tag ~= 2, need_retry = true; end
     end
+    
     if need_retry
-        d1 = 1e-4; d2 = 5e-4; 
+        % [Update] 扩大搜索半径至 1mm，确保能找到导体
+        d1 = 2e-4; % 0.2 mm
+        d2 = 1e-3; % 1.0 mm (Ultra Robust)
+        
         offsets = [0,0,-d1; 0,0,d1; -d1,0,0; d1,0,0; 0,-d1,0; 0,d1,0;
                    0,0,-d2; 0,0,d2; -d2,0,0; d2,0,0; 0,-d2,0; 0,d2,0;
                    -d1,-d1,-d1; d1,d1,d1];
+        
         for k = 1:size(offsets, 1)
             pt_try = pt + offsets(k, :);
             [val_try, idx_try] = try_probe(post, pt_try, type, A_sol, V_sol, omega, SigmaMap, J_field);
