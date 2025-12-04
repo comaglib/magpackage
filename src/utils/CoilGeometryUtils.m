@@ -17,7 +17,7 @@ classdef CoilGeometryUtils
         function [center, R, area, normal_axis_idx] = autoDetectCircular(mesh, regionID)
             % AUTODETECTCIRCULAR 自动识别圆形线圈
             % 输入: mesh对象, 区域ID
-            % 输出: 圆心, 半径, 法向轴索引(1=X,2=Y,3=Z)
+            % 输出: 圆心, 半径, 截面积, 法向轴索引(1=X,2=Y,3=Z)
             
             fprintf('   [CoilUtils] 正在识别圆形线圈 (Region %d)...\n', regionID);
             
@@ -25,7 +25,7 @@ classdef CoilGeometryUtils
             % 对于圆形，Lx_mean 和 Ly_mean 理论上相等且等于直径
             [center, H, Lx_mean, Ly_mean, ~, normal_axis_idx, WallWidths] = ...
                 CoilGeometryUtils.detectGeneralRect(mesh, regionID);
-                
+            
             Diameter = (Lx_mean + Ly_mean) / 2;
             R = Diameter / 2;
             area = mean(WallWidths) * H;
@@ -289,8 +289,7 @@ classdef CoilGeometryUtils
             pts_c = pts - center;
             
             % PCA 确定法向
-            C = cov(pts_c'); [V, D] = eig(C); [~, idx] = sort(diag(D));
-            axis_n = V(:, idx(1)); % 法向
+            [axis_n, center] = CoilGeometryUtils.fit_circle_normal_robust(pts);
             [~, normal_axis_idx] = max(abs(axis_n));
             
             % MABR 确定平面主轴 (消除 PCA 在正方形附近的旋转不确定性)
@@ -369,6 +368,55 @@ classdef CoilGeometryUtils
                 options = optimset('TolX', 1e-4, 'Display', 'off');
                 R_mean = fminbnd(err_fun, 0, Max_R, options);
                 if R_mean < 1e-3, R_mean = 0; end
+            end
+        end
+        
+        function [normal, center] = fit_circle_normal_robust(pts)
+            % FIT_CIRCLE_NORMAL_ROBUST 智能识别圆形/圆环/圆柱点云的法向
+            % 输入: pts - 3xN 点云数据
+            % 输出: normal - 3x1 法向量
+            %       center - 3x1 质心
+            
+            % 1. 数据预处理
+            center = mean(pts, 2);
+            pts_c = pts - center;
+            
+            % 2. PCA 分解
+            C = cov(pts_c'); 
+            [V, D] = eig(C); 
+            
+            % 3. 特征值排序 (从小到大)
+            [d, idx] = sort(diag(D)); 
+            % d(1) <= d(2) <= d(3)
+            
+            % 4. 智能判断策略：基于特征值间距 (Eigenvalue Gap)
+            % 圆形在平面内具有各向同性，因此平面内的两个特征值应该比较接近。
+            % 我们寻找那个与另外两个差异最大的特征值。
+            
+            diff_12 = abs(d(2) - d(1)); % 最小特征值与中间特征值的差距
+            diff_23 = abs(d(3) - d(2)); % 最大特征值与中间特征值的差距
+            
+            if diff_12 < diff_23
+                % 情况 A: d(1) 和 d(2) 比较接近 -> 说明它们构成了圆的截面
+                % 结论: d(3) (最大特征值) 是独特的轴向 -> "深管/圆柱"形态
+                axis_idx = 3;
+                % shape_type = 'Deep Tube/Cylinder';
+            else
+                % 情况 B: d(2) 和 d(3) 比较接近 -> 说明它们构成了圆的截面
+                % 结论: d(1) (最小特征值) 是独特的轴向 -> "扁平圆盘/垫圈"形态
+                axis_idx = 1;
+                % shape_type = 'Flat Disk/Ring';
+            end
+            
+            % 提取初步法向
+            normal = V(:, idx(axis_idx));
+            
+            % 5. 方向统一化 (解决 +/- 符号二义性)
+            % 简单策略：强制法向指向 Z 轴正半球
+            % 如果你的应用场景有特定视点，请修改此处逻辑
+            [~, max_dim] = max(abs(normal));
+            if normal(max_dim) < 0
+                normal = -normal;
             end
         end
         
@@ -512,6 +560,22 @@ classdef CoilGeometryUtils
             if axis_idx == 1, u_idx = 3; v_idx = 2;
             elseif axis_idx == 2, u_idx = 1; v_idx = 3;
             else, u_idx = 1; v_idx = 2; 
+            end
+        end
+        
+        function scale_factor = getUnitFactor(unit_tag)
+            
+            scale_factor = 1.0;
+            switch lower(unit_tag)
+                case 'm',  scale_factor = 1.0;
+                case 'cm', scale_factor = 1e-2;
+                case 'mm', scale_factor = 1e-3;
+                case 'um', scale_factor = 1e-6;
+                case 'nm', scale_factor = 1e-9;
+                case 'in', scale_factor = 0.0254;
+                case 'ft', scale_factor = 0.3048;
+                otherwise
+                    warning('未知的单位标签: "%s"。默认按米 (scale=1.0) 处理。', unit_tag);
             end
         end
     end

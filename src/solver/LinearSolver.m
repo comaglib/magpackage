@@ -1,35 +1,40 @@
 classdef LinearSolver < handle
-    % LINEARSOLVER 线性方程组求解器封装 (v3.6 - Symmetry Support)
-    %
-    % 更新:
-    %   1. [Symmetry] 增加 MumpsSymmetry 属性，支持设置矩阵对称性 (SYM)。
-    %      0=非对称(默认), 1=正定对称, 2=一般对称。
+    % LINEARSOLVER 线性方程组求解器封装 (v3.6 - Robust Exception Handling)
+    % 
+    % 修复:
+    %   1. [Critical] 修正 catch 块中的 MUMPS 清理调用语法 (id = dmumps(id))。
+    %      这是导致报错 "输出参数数目不足" 的直接原因。
+    %   2. 保持了 MRHS 支持和 NaN 检查。
     
     properties
-        Method = 'Auto' % 'Auto', 'MUMPS', 'Backslash', 'GMRES'
-        Tolerance = 1e-6
-        MaxIterations = 1000
-        MumpsICNTL = struct('i14', 40) 
-        ReuseAnalysis = false
-        MumpsSymmetry = 0; 
-        MumpsID 
+        Method = 'Auto'     
+        Tolerance = 1e-6    
+        MaxIter = 1000      
+        MumpsSymmetry= 0; % 0=Unsymmetric, 1=SPD, 2=General Symmetric
+        MumpsICNTL = struct('i14', 100) % 默认内存增加百分比
     end
     
     methods
         function obj = LinearSolver(method)
-            if nargin > 0, obj.Method = method; end
+            if nargin > 0
+                obj.Method = method;
+            else
+                obj.Method = 'Auto';
+            end
+            obj.MumpsICNTL.i7 = 5; 
         end
         
         function x = solve(obj, A, b)
-            if isempty(A) || size(A, 1) == 0
-                warning('LinearSolver:EmptySystem', 'System matrix is empty (0x0).');
-                x = []; return;
+            if any(isnan(A), 'all') || any(isinf(A), 'all')
+                error('LinearSolver:InputNaN', 'System matrix A contains NaN or Inf.');
             end
-            
+            if any(isnan(b), 'all') || any(isinf(b), 'all')
+                error('LinearSolver:InputNaN', 'RHS vector b contains NaN or Inf.');
+            end
+
             use_method = obj.Method;
             if strcmpi(use_method, 'Auto')
-                hasMumps = (exist('dmumps', 'file') >= 2) || (exist('zmumps', 'file') >= 2);
-                if size(A, 1) > 100 && hasMumps
+                if exist('initmumps', 'file') == 2 || exist('initmumps', 'file') == 3
                     use_method = 'MUMPS';
                 else
                     use_method = 'Backslash';
@@ -37,85 +42,97 @@ classdef LinearSolver < handle
             end
             
             switch upper(use_method)
-                case 'BACKSLASH'
+                case 'MUMPS'
+                    x = obj.solveMumps(A, b);
+                    
+                case {'BACKSLASH', 'DIRECT'}
                     x = A \ b;
                     
-                case 'MUMPS'
-                    try
-                        is_complex = ~isreal(A) || ~isreal(b);
-                        
-                        % 初始化 (如果需要)
-                        if isempty(obj.MumpsID) || ~obj.ReuseAnalysis
-                            % 1. 获取默认结构体
-                            obj.MumpsID = initmumps;
-                            
-                            % 2. 初始化实例 (JOB = -1)
-                            if is_complex
-                                obj.MumpsID = zmumps(obj.MumpsID);
-                            else
-                                obj.MumpsID = dmumps(obj.MumpsID);
-                            end
-                            
-                            % 3. [New] 设置对称性 (必须在 Analysis 之前设置)
-                            % 注意: 这里将类的属性传递给 MUMPS 结构体
-                            obj.MumpsID.SYM = obj.MumpsSymmetry;
-                            
-                            % 4. 设置控制参数 (ICNTL)
-                            obj.MumpsID.JOB = 1; % 准备 Analysis
-                            if isfield(obj.MumpsICNTL, 'i14')
-                                if length(obj.MumpsID.ICNTL) >= 14
-                                    obj.MumpsID.ICNTL(14) = obj.MumpsICNTL.i14;
-                                end
-                            end
-                            
-                            % 5. 执行分析 (Analysis)
-                            if is_complex
-                                obj.MumpsID = zmumps(obj.MumpsID, A);
-                            else
-                                obj.MumpsID = dmumps(obj.MumpsID, A);
-                            end
-                        end
-                        
-                        % 6. 因子分解与求解 (Factorization & Solve)
-                        obj.MumpsID.JOB = 6; 
-                        obj.MumpsID.RHS = b;
-                        
-                        if is_complex
-                            obj.MumpsID = zmumps(obj.MumpsID, A);
+                case 'ITERATIVE'
+                    if size(b, 2) > 1
+                         warning('Iterative solver called with MRHS. Switching to Backslash.');
+                         x = A \ b;
+                    else
+                        if obj.MumpsSymmetry
+                            [x, flag] = minres(A, b, obj.Tolerance, obj.MaxIter);
                         else
-                            obj.MumpsID = dmumps(obj.MumpsID, A);
+                            [x, flag] = gmres(A, b, [], obj.Tolerance, obj.MaxIter);
                         end
-                        
-                        x = obj.MumpsID.SOL;
-                        
-                        % 7. 清理
-                        if ~obj.ReuseAnalysis
-                            obj.MumpsID.JOB = -2;
-                            try 
-                                if is_complex, zmumps(obj.MumpsID); else, dmumps(obj.MumpsID); end 
-                            catch
-                            end
-                            obj.MumpsID = [];
+                        if flag ~= 0
+                            warning('Iterative solver did not converge (Flag: %d)', flag);
                         end
-                        
-                    catch ME
-                        fprintf('      [LinearSolver] Warning: MUMPS failed (%s). Fallback to Backslash.\n', ME.message);
-                        obj.MumpsID = [];
-                        x = A \ b;
                     end
                     
-                case 'GMRES'
-                    [x, ~] = gmres(A, b, [], obj.Tolerance, obj.MaxIterations);
-                    
                 otherwise
-                    error('Unknown solver method: %s', use_method);
+                    error('Unknown solver method: %s', obj.Method);
             end
         end
-        
-        function delete(obj)
-            if ~isempty(obj.MumpsID)
-                obj.MumpsID.JOB = -2;
-                try dmumps(obj.MumpsID); catch; try zmumps(obj.MumpsID); catch; end; end
+    end
+    
+    methods (Access = private)
+        function x = solveMumps(obj, A, b)
+            id = initmumps;
+            id.JOB = -1; 
+            id.SYM = 0;  
+            if obj.MumpsSymmetry, id.SYM = 2; end
+            
+            is_complex = ~isreal(A) || ~isreal(b);
+            if is_complex, id = zmumps(id); else, id = dmumps(id); end
+            
+            id.ICNTL(1:4) = 0; 
+            if ~isempty(obj.MumpsICNTL)
+                fnames = fieldnames(obj.MumpsICNTL);
+                for k = 1:length(fnames)
+                    name = fnames{k};
+                    idx = str2double(erase(name, 'i')); 
+                    if ~isnan(idx), id.ICNTL(idx) = obj.MumpsICNTL.(name); end
+                end
+            end
+            
+            id.JOB = 6; 
+            
+            % MUMPS 要求 RHS 为满矩阵
+            if issparse(b)
+                id.RHS = full(b); 
+            else
+                id.RHS = b;
+            end
+            
+            try
+                if is_complex
+                    if isreal(A), A = complex(A); end 
+                    id = zmumps(id, A); % 必须接收 id
+                else
+                    id = dmumps(id, A); % 必须接收 id
+                end
+            catch ME
+                fprintf('[MUMPS Error] MEX call failed: %s\n', ME.message);
+                id.JOB = -2;
+                % [Fix] 这里的调用之前缺少接收变量，导致掩盖了真实错误
+                if is_complex
+                    id = zmumps(id); 
+                else
+                    id = dmumps(id); 
+                end
+                rethrow(ME);
+            end
+            
+            % 错误检查
+            if id.INFOG(1) < 0
+                err1 = id.INFOG(1); err2 = id.INFOG(2);
+                id.JOB = -2;
+                if is_complex, id = zmumps(id); else, id = dmumps(id); end
+                error('MUMPS Solver Failed: INFOG(1)=%d, INFOG(2)=%d', err1, err2);
+            end
+            
+            x = id.SOL;
+            
+            % 清理
+            id.JOB = -2; 
+            if is_complex
+                id = zmumps(id); % [Fix] 必须接收 id
+            else
+                id = dmumps(id); % [Fix] 必须接收 id
             end
         end
     end

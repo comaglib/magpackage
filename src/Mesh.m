@@ -84,12 +84,64 @@ classdef Mesh < handle
             fprintf('[Mesh] Topology built: %d Edges found.\n', numEdges);
         end
         
+        function generateFaces(obj)
+            % GENERATEFACES 生成四面体网格的面拓扑 (Triangular Faces)
+            %
+            % 功能:
+            %   从四面体连接关系 (obj.T) 中提取所有唯一的三角形面，
+            %   并存储在 obj.Faces 中。
+            %   (如果 obj.Faces 已存在且包含数据，该函数可能会覆盖它以确保包含内部面)
+            
+            % 如果需要强制重新生成，可注释掉下面这行
+            if ~isempty(obj.Faces) && size(obj.Faces, 2) > size(obj.T, 2), return; end
+            
+            fprintf('[Mesh] Generating Face topology...\n');
+            
+            % 四面体的4个面 (局部节点索引定义)
+            % 组合: [1 2 3], [1 2 4], [1 3 4], [2 3 4]
+            local_face_defs = [1 2 3; 1 2 4; 1 3 4; 2 3 4];
+            
+            % 预分配/构造大矩阵
+            % obj.T 是 [4 x N_elems]
+            
+            % 提取所有单元的4个面
+            % 为了向量化操作，我们将所有面堆叠起来
+            F1 = obj.T(local_face_defs(1,:), :)'; % [N_elems x 3]
+            F2 = obj.T(local_face_defs(2,:), :)';
+            F3 = obj.T(local_face_defs(3,:), :)';
+            F4 = obj.T(local_face_defs(4,:), :)';
+            
+            % 合并所有面: [4*N_elems x 3]
+            all_raw_faces = [F1; F2; F3; F4];
+            
+            % 对每个面的节点索引进行排序 (行内排序)，以确保唯一性判断不受节点顺序影响
+            % 例如 [3 1 2] 和 [1 2 3] 被视为同一个面
+            all_sorted_faces = sort(all_raw_faces, 2);
+            
+            % 使用 unique 函数查找唯一面
+            % 'rows' 表示按行比较
+            unique_faces = unique(all_sorted_faces, 'rows');
+            
+            % 转置并存储结果: [3 x N_unique_faces]
+            obj.Faces = unique_faces';
+            
+            % 这里的 NumFaces 是所有面（包括内部面和边界面）的总数
+            fprintf('[Mesh] Faces generated: %d unique faces found.\n', size(obj.Faces, 2));
+            
+            % (可选) 如果您以后需要单元到面的映射 (T2F)，可以在这里扩展:
+            % [unique_faces, ~, ic] = unique(...);
+            % obj.T2F = reshape(ic, [], 4)';
+        end
+        
         function stats(obj)
             fprintf('--- Mesh Statistics ---\n');
             fprintf('Nodes: %d\n', obj.NumNodes);
             fprintf('Elements: %d\n', obj.NumElements);
             if ~isempty(obj.Edges)
                 fprintf('Edges: %d\n', size(obj.Edges, 2));
+            end
+            if ~isempty(obj.Faces)
+                fprintf('Faces: %d\n', size(obj.Faces, 2));
             end
         end
     end

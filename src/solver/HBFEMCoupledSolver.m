@@ -20,7 +20,7 @@ classdef HBFEMCoupledSolver < handle
         BacktrackFactor = 0.5
         MinStepSize = 1e-6
         
-        MatrixK_Add % 用于正则化
+        MatrixK_Add
     end
     
     methods
@@ -32,7 +32,6 @@ classdef HBFEMCoupledSolver < handle
             
             obj.LinearSolver = LinearSolver('Auto');
             obj.LinearSolver.MumpsICNTL.i14 = 100; 
-            obj.LinearSolver.ReuseAnalysis = false;
         end
         
         function [X_sol, I_sol, info] = solve(obj, space, matLibData, V_harmonics, fixedDofs, x0)

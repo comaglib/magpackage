@@ -14,7 +14,6 @@ classdef ScalarSolver < handle
             obj.Assembler = assembler;
             obj.LinearSolver = LinearSolver('Auto');
             obj.LinearSolver.MumpsICNTL.i14 = 40;
-            obj.LinearSolver.ReuseAnalysis = false;
             
             % [New] 启用对称正定模式
             % SYM = 1: Symmetric Positive Definite (SPD)

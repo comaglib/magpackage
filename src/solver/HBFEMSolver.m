@@ -25,7 +25,6 @@ classdef HBFEMSolver < handle
             obj.AFT = aft;
             obj.LinearSolver = LinearSolver('Auto');
             obj.LinearSolver.MumpsICNTL.i14 = 100; 
-            obj.LinearSolver.ReuseAnalysis = false;
         end
         
         function [X_harmonics, info] = solve(obj, space, matLibData, sourceMaps, fixedDofs, x0)
