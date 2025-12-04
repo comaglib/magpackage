@@ -59,9 +59,6 @@ space_A = FunctionSpace('Nedelec', 1);
 dofHandler = DofHandler(mesh);
 dofHandler.distributeDofs(space_A);
 
-space_P = FunctionSpace('Lagrange', 1);
-dofHandler.distributeDofs(space_P);
-
 %% --- 3. 线圈与电路耦合设置 ---
 fprintf('[Step 3] Setup Field-Circuit Coupling...\n');
 
@@ -94,17 +91,13 @@ dt = 5e-4;
 timeSteps = repmat(dt, round(0.01/dt), 1);
 
 fixedDofs_A = BoundaryCondition.findOuterBoundaryDofs(mesh, dofHandler, space_A);
-fixedDofs_P = BoundaryCondition.findOuterBoundaryDofs(mesh, dofHandler, space_P);
-
-fprintf('[BC] Fixed A-Dofs: %d, Fixed P-Dofs: %d (Full Boundary)\n', ...
-        sum(fixedDofs_A), sum(fixedDofs_P));
 
 %% --- 5. 求解 ---
 fprintf('[Step 5] Solving...\n');
 
-[sols, info] = solver.solve(space_A, space_P, matLib, sigmaMap, ...
+[sols, info] = solver.solve(space_A, matLib, sigmaMap, ...
                             circuit, winding, timeSteps, ...
-                            fixedDofs_A, fixedDofs_P, []);
+                            fixedDofs_A, []);
 
 %% --- 6. 后处理 ---
 fprintf('[Step 6] Post-Processing...\n');
@@ -125,7 +118,7 @@ xlabel('Time (s)'); ylabel('Current (A)');
 title('Primary Coil Current (No Eddy)');
 
 % 绘制铁芯 B 场
-target_t = 0.007;
+target_t = 0.006;
 [~, step_idx] = min(abs(time_vec - target_t));
 A_sol = sols(1:dofHandler.NumGlobalDofs);
 

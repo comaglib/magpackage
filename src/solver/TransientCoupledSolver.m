@@ -1,11 +1,14 @@
 classdef TransientCoupledSolver < handle
-    % TRANSIENTCOUPLEDSOLVER 场路耦合非线性瞬态求解器 (v3.5 - Stiffness Matching Fix)
+    % TRANSIENTCOUPLEDSOLVER 场路耦合非线性瞬态求解器 (v4.0 - Regularization)
+    % 
+    % 描述:
+    %   回归正则化方法 (Penalty/Regularization)，放弃拉格朗日乘子。
+    %   通过在刚度矩阵中添加微小的质量矩阵项 (epsilon * M) 来消除 A 的零空间奇异性。
+    %   这种方法在非线性高反差问题中比 Lagrange 乘子法更鲁棒。
     %
     % 更新日志:
-    %   v3.5: [Physics Fix] 彻底修复 Locking 问题。
-    %         将 LagrangeScale 的计算基准从"空气刚度"改为"铁芯刚度"。
-    %         大幅降低约束项的数值强度，防止其掩盖铁芯内的物理磁化过程。
-    %   v3.3: [Fix] 修复矩阵转置块缺失。
+    %   v4.0: [Revert] 移除 space_P (Lagrange Multiplier)。
+    %         [Add] 引入 Mass-Matrix Regularization。
     
     properties
         Assembler
@@ -13,17 +16,15 @@ classdef TransientCoupledSolver < handle
         
         Dt = 0.01
         
-        % --- 非线性迭代配置 ---
         MaxIterations = 50
-        Tolerance = 1e-4
-        RelTolerance = 1e-4    
+        Tolerance = 1e-3
+        RelTolerance = 1e-2
         UseLineSearch = true
         MaxLineSearchIters = 10
         Relaxation = 1.0
         
-        % [Scaling]
-        LagrangeScale = 1.0; 
-        CircuitScale = 1e5;
+        RegularizationFactor = 8e-2; 
+        CircuitScale = 1.0;
     end
     
     methods
@@ -31,67 +32,43 @@ classdef TransientCoupledSolver < handle
             obj.Assembler = assembler;
             obj.LinearSolver = LinearSolver('Auto');
             obj.LinearSolver.MumpsICNTL.i14 = 400; 
-            obj.LinearSolver.MumpsSymmetry = 0; 
+            obj.LinearSolver.MumpsSymmetry = 0; % 非对称模式 (为了通用性)
         end
         
-        function [solutionResults, info] = solve(obj, space_A, space_P, matLib, sigmaMap, ...
+        function [solutionResults, info] = solve(obj, space_A, matLib, sigmaMap, ...
                                                  circuitProps, windingObj, ...
-                                                 timeSteps, fixedDofs_A, fixedDofs_P, init_State)
+                                                 timeSteps, fixedDofs_A, init_State)
             
             fprintf('==================================================\n');
-            fprintf('   Transient Coupled Solver (v3.5 Physics Unlocked)\n');
+            fprintf('   Transient Coupled Solver (v4.0 Regularization) \n');
             fprintf('==================================================\n');
             
-            if isempty(space_P), error('Need space_P for Lagrange method.'); end
             dofHandler = obj.Assembler.DofHandler;
             
             % 1. 自由度分配
             if ~dofHandler.DofMaps.isKey(space_A.toString()), dofHandler.distributeDofs(space_A); end
-            [~, offset_A] = dofHandler.distributeDofs(space_A);
             num_A = dofHandler.SpaceLocalSizes(space_A.toString());
-            
-            if ~dofHandler.DofMaps.isKey(space_P.toString())
-                dofHandler.distributeDofs(space_P, unique(obj.Assembler.Mesh.RegionTags));
-            end
-            offset_P = dofHandler.SpaceOffsets(space_P.toString());
-            num_P = dofHandler.SpaceLocalSizes(space_P.toString());
-            
             numFemDofs = dofHandler.NumGlobalDofs;
-            numTotalDofs = numFemDofs + 1;
+            numTotalDofs = numFemDofs + 1; % +1 Circuit Dof
             
-            % 2. 预计算与 Scaling
-            ctx.num_A = num_A; ctx.num_P = num_P; ctx.offset_P = offset_P;
+            % 2. 预计算
+            ctx.num_A = num_A; 
             ctx.numTotalDofs = numTotalDofs;
             ctx.space_A = space_A; ctx.matLib = matLib; ctx.circuit = circuitProps;
             
             fprintf('   [Init] Assembling invariant matrices...\n');
+            
+            % M_sigma: 导电区域的涡流项 (sigma * dA/dt)
             M_sigma_local = obj.Assembler.assembleMassWeighted(space_A, sigmaMap);
             [mi, mj, mv] = find(M_sigma_local);
             ctx.M_sigma = sparse(mi, mj, mv, numTotalDofs, numTotalDofs); 
             
-            % G 矩阵
-            unitMap = containers.Map('KeyType', 'double', 'ValueType', 'double');
-            tags = unique(obj.Assembler.Mesh.RegionTags);
-            for i=1:length(tags), unitMap(tags(i))=1.0; end
-            G_local = obj.Assembler.assembleCoupling(space_A, space_P, unitMap);
-            
-            % [Auto-Scaling Correction]
-            % 关键修改：使用 1e3 (典型铁芯磁阻率) 而不是 1e7 (真空) 作为刚度基准
-            % 这样约束项的量级将与铁芯物理项匹配，避免"锁死"铁芯。
-            target_nu = 1e3;
-            temp_K = obj.Assembler.assembleStiffness(space_A, target_nu); 
-            
-            avg_K = mean(abs(nonzeros(temp_K)));
-            avg_G = mean(abs(nonzeros(G_local)));
-            
-            % 稍微给一点安全余量 (*10)，保证约束依然有效，但不至于压倒物理
-            obj.LagrangeScale = (avg_K / avg_G) * 10.0;
-            
-            fprintf('   [Scaling] Target_Nu=%.0f -> Scale=%.1e (Iron-Matched)\n', ...
-                target_nu, obj.LagrangeScale);
-            
-            [gi, gj, gv] = find(G_local);
-            ctx.G_mat = sparse(gi, gj, gv * obj.LagrangeScale, numTotalDofs, numTotalDofs);
+            % M_reg: 正则化质量矩阵 (全域 Mass)
+            % 用于填充 A 的零空间 (Null Space)，防止奇异
+            fprintf('   [Reg] Assembling regularization mass matrix...\n');
+            M_reg_local = obj.Assembler.assembleMass(space_A);
+            [ri, rj, rv] = find(M_reg_local);
+            ctx.M_reg = sparse(ri, rj, rv, numTotalDofs, numTotalDofs);
             
             W_fem = obj.Assembler.assembleWinding(space_A, windingObj);
             ctx.W_vec = sparse(numTotalDofs, 1);
@@ -100,16 +77,13 @@ classdef TransientCoupledSolver < handle
             
             % 3. 初始化与BC
             x_prev = zeros(numTotalDofs, 1);
-            if nargin >= 11 && ~isempty(init_State)
+            if nargin >= 9 && ~isempty(init_State)
                 n_c = min(length(init_State), numTotalDofs);
                 x_prev(1:n_c) = init_State(1:n_c);
             end
             
             if islogical(fixedDofs_A), idx_A = find(fixedDofs_A); else, idx_A = fixedDofs_A(:); end
-            if islogical(fixedDofs_P), idx_P = find(fixedDofs_P); else, idx_P = fixedDofs_P(:); end
-            
-            idx_P_global = idx_P + offset_P;
-            all_fixed = [idx_A; idx_P_global];
+            all_fixed = idx_A; % 只有 A 的边界，没有 P
             all_fixed = all_fixed(all_fixed <= numTotalDofs);
             
             isLinearSystem = obj.checkLinearity(matLib);
@@ -127,12 +101,23 @@ classdef TransientCoupledSolver < handle
                 
                 x_curr = x_prev; converged = false;
                 
-                [J_sys, R_sys] = obj.evaluateSystem(x_curr, ctx, true);
+                % 首次评估 (计算初始残差)
+                [J_sys, R_sys, eps_scale] = obj.evaluateSystem(x_curr, ctx, true, 0);
+                
+                % 确定正则化强度 (基于刚度矩阵对角线)
+                if t_idx == 1
+                     avg_diag = mean(abs(diag(J_sys(1:num_A, 1:num_A))));
+                     if avg_diag == 0, avg_diag = 1.0; end
+                     ctx.eps_val = avg_diag * obj.RegularizationFactor;
+                     fprintf('   [Reg] Regularization Strength: %.2e (Factor=%.1e)\n', full(ctx.eps_val), obj.RegularizationFactor);
+                     
+                     % 重新评估带正则化的系统
+                     [J_sys, R_sys] = obj.evaluateSystem(x_curr, ctx, true, ctx.eps_val);
+                end
+                
                 [J_bc, Res_bc] = BoundaryCondition.applyDirichlet(J_sys, R_sys, all_fixed);
                 norm_res = norm(Res_bc);
-                
-                initial_res = norm_res;
-                if initial_res < 1e-20, initial_res = 1.0; end 
+                initial_res = norm_res; if initial_res < 1e-20, initial_res = 1.0; end 
                 
                 for iter = 1:obj.MaxIterations
                     rel_res = norm_res / initial_res;
@@ -153,7 +138,7 @@ classdef TransientCoupledSolver < handle
                         for k = 0:obj.MaxLineSearchIters
                             alpha_try = alpha * (0.5^k);
                             x_try = x_curr + alpha_try * delta_x;
-                            [~, R_try] = obj.evaluateSystem(x_try, ctx, false);
+                            [~, R_try] = obj.evaluateSystem(x_try, ctx, false, ctx.eps_val);
                             R_try(all_fixed) = 0; 
                             if norm(R_try) < res_prev || (iter==1 && k<3)
                                 alpha = alpha_try;
@@ -165,12 +150,13 @@ classdef TransientCoupledSolver < handle
                     
                     x_curr = x_curr + alpha * delta_x;
                     
-                    [J_sys, R_sys] = obj.evaluateSystem(x_curr, ctx, true);
+                    [J_sys, R_sys] = obj.evaluateSystem(x_curr, ctx, true, ctx.eps_val);
                     [J_bc, Res_bc] = BoundaryCondition.applyDirichlet(J_sys, R_sys, all_fixed);
                     norm_res = norm(Res_bc);
                     
                     I_val = x_curr(end);
-                    fprintf('      Iter %d: Res=%.4e, I=%.4f A\n', iter, norm_res, I_val);
+                    fprintf('    Iter %d: Res = %.4e, RelRes = %.4e, I = %.6e\n', ...
+                        iter, norm_res, norm_res/initial_res, I_val);
                     
                     if isLinearSystem && norm_res < 1e-9, converged = true; break; end
                 end
@@ -186,22 +172,26 @@ classdef TransientCoupledSolver < handle
     end
     
     methods (Access = private)
-        function [J_out, R_out] = evaluateSystem(obj, x, ctx, calc_J)
+        function [J_out, R_out, eps_scale] = evaluateSystem(obj, x, ctx, calc_J, eps_reg)
             A_vec = x(1:ctx.num_A);
             I_val = x(end);
             
+            % 1. 物理刚度 (Curl-Curl)
             [J_fem_local, R_nu] = obj.Assembler.assembleJacobian(ctx.space_A, A_vec, ctx.matLib, calc_J);
             if size(R_nu, 1) < ctx.numTotalDofs, R_nu(ctx.numTotalDofs, 1) = 0; end
             
             dx_dt = (x - ctx.x_prev) / ctx.dt;
             
+            % 2. 涡流项 + 正则化项
+            % R_total = R_nu + M_sigma * dx/dt + eps * M_reg * A
+            % 注意: 正则化是对 A 本身进行惩罚 (类似 A term)，不是对 dx/dt
             term_eddy = ctx.M_sigma * dx_dt; 
-            term_constraint = ctx.G_mat * x; 
-            term_constraint_T = ctx.G_mat.' * x;
+            term_reg  = eps_reg * ctx.M_reg * x; % 惩罚项: eps * M * A
             
-            R_out = R_nu + term_eddy + term_constraint + term_constraint_T;
+            R_out = R_nu + term_eddy + term_reg;
+            
+            % 3. 电路耦合 (RHS)
             R_out = R_out - ctx.W_vec * I_val;
-            
             term_R = ctx.circuit.R * I_val;
             term_L = ctx.circuit.L * dx_dt(end);
             term_EMF = ctx.W_vec' * dx_dt; 
@@ -209,13 +199,15 @@ classdef TransientCoupledSolver < handle
             R_out(end) = -Res_I * ctx.CircuitRowScale;
             
             J_out = [];
+            eps_scale = 0;
             if calc_J
                 [ji, jj, jv] = find(J_fem_local);
                 J_fem_ext = sparse(ji, jj, jv, ctx.numTotalDofs, ctx.numTotalDofs);
                 
-                J_out = J_fem_ext + ctx.M_sigma / ctx.dt;
-                J_out = J_out + ctx.G_mat + ctx.G_mat.';
+                % J = K(nu) + M_sigma/dt + eps * M_reg
+                J_out = J_fem_ext + ctx.M_sigma / ctx.dt + eps_reg * ctx.M_reg;
                 
+                % 电路耦合项
                 [w_idx, ~, w_val] = find(ctx.W_vec); num_nz = length(w_idx);
                 J_col_I = sparse(w_idx, repmat(ctx.numTotalDofs, num_nz, 1), w_val, ctx.numTotalDofs, ctx.numTotalDofs);
                 J_out = J_out - J_col_I;
