@@ -103,24 +103,16 @@ fprintf('[Done] Calculation Completed.\n');
 %  本地辅助函数
 % =========================================================================
 
-function [J_field] = analyzeCoil(mesh, coil_tag)
+function J_field = analyzeCoil(mesh, coil_tag)
     % ANALYZECOIL 自动分析线圈几何并生成源电流密度场
     
     % 1. 识别跑道型线圈的几何参数 (中心、半径、长宽、轴向)
-    [center, R_in, R_out, Lx, Ly, axis_idx] = ...
+    [center, ~, ~, Lx, Ly, area, axis_idx] = ...
         CoilGeometryUtils.autoDetectRoundedRect(mesh, coil_tag);
     
     % 2. 计算电流密度幅值 (安匝数 / 平均截面积)
-    AmpereTurns = 2742; 
-    tempAssembler = Assembler(mesh, DofHandler(mesh));
-    lossCalc = LossCalculator(tempAssembler);
-    all_vols = lossCalc.computeElementVolumes();
-    
-    vol_total = sum(all_vols(mesh.RegionTags == coil_tag)); % 线圈总体积
-    R_avg = (R_in + R_out) / 2;
-    len_avg = 2*Lx + 2*Ly + 2*pi*R_avg; % 平均周长
-    area_avg = vol_total / len_avg;     % 平均截面积
-    J_mag = AmpereTurns / area_avg;
+    AmpereTurns = 2742;
+    J_mag = AmpereTurns / area;
     
     % 3. 生成单位方向向量场
     dir_map = CoilGeometryUtils.computeRoundedRectDirection(...

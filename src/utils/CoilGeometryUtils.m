@@ -12,10 +12,9 @@ classdef CoilGeometryUtils
     %   3. 向量化计算: 电流方向计算完全向量化，支持百万级单元的毫秒级处理。
     
     methods (Static)
-        %% ================================================================
+        
         %  1. 圆形线圈 (Circular Coil)
-        %  ================================================================
-        function [center, R, normal_axis_idx] = autoDetectCircular(mesh, regionID)
+        function [center, R, area, normal_axis_idx] = autoDetectCircular(mesh, regionID)
             % AUTODETECTCIRCULAR 自动识别圆形线圈
             % 输入: mesh对象, 区域ID
             % 输出: 圆心, 半径, 法向轴索引(1=X,2=Y,3=Z)
@@ -24,11 +23,12 @@ classdef CoilGeometryUtils
             
             % 借用通用矩形检测算法获取骨架尺寸
             % 对于圆形，Lx_mean 和 Ly_mean 理论上相等且等于直径
-            [center, Lx_mean, Ly_mean, ~, normal_axis_idx, ~] = ...
+            [center, H, Lx_mean, Ly_mean, ~, normal_axis_idx, WallWidths] = ...
                 CoilGeometryUtils.detectGeneralRect(mesh, regionID);
                 
             Diameter = (Lx_mean + Ly_mean) / 2;
             R = Diameter / 2;
+            area = mean(WallWidths) * H;
             
             fprintf('   -> 识别结果: Center=[%.3f %.3f %.3f], R=%.4f\n', ...
                 center(1), center(2), center(3), R);
@@ -77,18 +77,16 @@ classdef CoilGeometryUtils
             full_indices = find(mask);
             dir_map(:, full_indices(valid)) = dir_vecs;
         end
-
-        %% ================================================================
+        
         %  2. 跑道型线圈 (Racetrack Coil)
-        %  ================================================================
-        function [center, L_straight, R_curve, normal_axis_idx] = autoDetectRacetrack(mesh, regionID)
+        function [center, L_straight, R_curve, area, normal_axis_idx] = autoDetectRacetrack(mesh, regionID)
             % AUTODETECTRACETRACK 自动识别跑道型线圈
             % 跑道型由矩形直段和两端的半圆组成。
             
             fprintf('   [CoilUtils] 正在识别跑道型线圈 (Region %d)...\n', regionID);
             
             % 1. 通用检测获取骨架尺寸
-            [center, Lx_mean, Ly_mean, R_mean, normal_axis_idx, ~] = ...
+            [center, H, Lx_mean, Ly_mean, R_mean, normal_axis_idx, WallWidths] = ...
                 CoilGeometryUtils.detectGeneralRect(mesh, regionID);
             
             % 2. 几何推导
@@ -102,6 +100,8 @@ classdef CoilGeometryUtils
             end
             
             if L_straight < 0, L_straight = 0; end
+            
+            area = mean(WallWidths) * H;
             
             fprintf('   -> 识别结果: Center=[%.3f %.3f %.3f], L=%.4f, R=%.4f\n', ...
                 center(1), center(2), center(3), L_straight, R_curve);
@@ -165,19 +165,18 @@ classdef CoilGeometryUtils
             end
         end
         
-        %% ================================================================
         %  3. 圆角矩形线圈 (Rounded Rectangle Coil)
-        %  ================================================================
-        function [center, R_in, R_out, Lx, Ly, normal_axis_idx] = autoDetectRoundedRect(mesh, regionID)
+        function [center, R_in, R_out, Lx, Ly, area, normal_axis_idx] = autoDetectRoundedRect(mesh, regionID)
             % AUTODETECTROUNDEDRECT 自动识别圆角矩形
             % 输出:
             %   Lx, Ly: 骨架直段长度
             %   R_in, R_out: 内外圆角半径
+            %   area: 平均截面积
             
             fprintf('   [CoilUtils] 正在识别圆角矩形 (Region %d)...\n', regionID);
             
             % 1. 核心检测 (返回骨架尺寸和双向壁厚)
-            [center, Lx_mean, Ly_mean, R_mean, normal_axis_idx, WallWidths] = ...
+            [center, H, Lx_mean, Ly_mean, R_mean, normal_axis_idx, WallWidths] = ...
                 CoilGeometryUtils.detectGeneralRect(mesh, regionID);
             
             % 2. 导出参数
@@ -187,6 +186,7 @@ classdef CoilGeometryUtils
             avg_wall = mean(WallWidths);
             R_out = R_mean + avg_wall / 2;
             R_in  = R_mean - avg_wall / 2;
+            area = avg_wall * H;
             
             if Lx < 0, Lx = 0; end
             if Ly < 0, Ly = 0; end
@@ -269,10 +269,8 @@ classdef CoilGeometryUtils
             end
         end
         
-        %% ================================================================
         %  核心算法: 通用矩形检测 (General Rect Detection)
-        %  ================================================================
-        function [center, Lx_mean, Ly_mean, R_mean, normal_axis_idx, WallWidths] = detectGeneralRect(mesh, regionID)
+        function [center, H, Lx_mean, Ly_mean, R_mean, normal_axis_idx, WallWidths] = detectGeneralRect(mesh, regionID)
             % DETECTGENERALRECT 通过平面求交法精确测量线圈几何参数
             %
             % 步骤:

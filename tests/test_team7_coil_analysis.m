@@ -44,7 +44,7 @@ fprintf('[Step 2] Merged regions %s into ID %d for analysis.\n', ...
 
 % 4. 几何特征分析
 fprintf('[Step 3] Analyzing Geometry...\n');
-[center, R_in, R_out, Lx, Ly, ax_idx] = CoilGeometryUtils.autoDetectRoundedRect(mesh, coil_id_merged);
+[center, R_in, R_out, Lx, Ly, ~, ax_idx] = CoilGeometryUtils.autoDetectRoundedRect(mesh, coil_id_merged);
 
 fprintf('   -> Analysis Result (Units: m):\n');
 fprintf('      Center = [%.4f, %.4f, %.4f]\n', center);

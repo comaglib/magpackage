@@ -22,7 +22,7 @@ mesh1 = create_mesh(P, T);
 viz1 = create_viz(mesh1);
 
 tic;
-[center, R, ax_idx] = CoilGeometryUtils.autoDetectCircular(mesh1, 1);
+[center, R, ~, ax_idx] = CoilGeometryUtils.autoDetectCircular(mesh1, 1);
 t_detect = toc;
 
 check_pass('Radius', R, R_mean, 0.02);
@@ -49,7 +49,7 @@ mesh2 = create_mesh(P, T);
 viz2 = create_viz(mesh2);
 
 tic;
-[center, L, R, ax_idx] = CoilGeometryUtils.autoDetectRacetrack(mesh2, 1);
+[center, L, R, ~, ax_idx] = CoilGeometryUtils.autoDetectRacetrack(mesh2, 1);
 t_detect = toc;
 
 check_pass('Length', L, L_str, 0.05);
@@ -75,7 +75,7 @@ mesh3 = create_mesh(P, T);
 viz3 = create_viz(mesh3);
 
 tic;
-[center, R_in, R_out, Lx, Ly, ax_idx] = CoilGeometryUtils.autoDetectRoundedRect(mesh3, 1);
+[center, R_in, R_out, Lx, Ly, ~, ax_idx] = CoilGeometryUtils.autoDetectRoundedRect(mesh3, 1);
 t_detect = toc;
 
 check_pass('Lx (Straight)', Lx, Lx_skel, 0.08);
