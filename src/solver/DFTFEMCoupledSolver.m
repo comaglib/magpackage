@@ -1,44 +1,41 @@
-classdef HBFEMCoupledSolver < handle
-    % HBFEMCOUPLEDSOLVER 场路耦合谐波平衡求解器 (v1.0 - Fully Commented)
+classdef DFTFEMCoupledSolver < handle
+    % DFTFEMCoupledSolver 场路耦合离散傅里叶变换求解器
     % 
-    % 功能描述:
-    %   本求解器用于解决由电压源激励的、包含非线性磁性材料的二维/三维稳态磁场问题。
-    %   它采用谐波平衡法 (Harmonic Balance FEM)，将时域的非线性问题转化为频域的
-    %   耦合方程组求解。
+    % 描述:
+    %   基于 HBFEMCoupledSolver 开发。
+    %   专用于全频谱 (Full Spectrum) 求解，即时域采样点数与频域自由度数匹配的情况。
+    %   此时变换矩阵是方阵 (或满秩矩形阵)，等效于在每个时间步满足方程。
     %
-    % 数学模型 (强耦合系统):
-    %   [ J_field    -C      ] [ dA ]   [ -Res_Field   ]
-    %   [ jwC^T     Z_circ   ] [ dI ] = [ -Res_Circuit ]
+    %   适用场景:
+    %   - 波形畸变极其严重，难以预知主要谐波次数的情况。
+    %   - 需要极高精度的非线性时域重构。
     %
-    %   其中:
-    %   - J_field: 非线性磁场的切线刚度矩阵 (包含各次谐波间的耦合)。
-    %   - C: 线圈绕组的耦合向量 (将电流映射为电流密度)。
-    %   - jwC^T: 感应电动势 (EMF) 项的系数矩阵。
-    %   - Z_circ: 电路阻抗矩阵 (通常是对角的电阻 R)。
+    %   注意: 
+    %   相比稀疏 HBFEM，DFTFEM 的系统矩阵更稠密，内存消耗显著增加。
     
     properties
-        Assembler       % 有限元组装器 (负责组装 K, M, C 等矩阵)
-        AFT             % 谐波-时域转换器 (Alternating Frequency Time)
-        LinearSolver    % 线性方程组求解器 (MUMPS 接口)
+        Assembler       % 有限元组装器
+        AFT             % 谐波-时域转换器 (应配置为全谐波模式)
+        LinearSolver    % 线性求解器
         
-        WindingObj      % 绕组对象 (定义线圈几何与匝数)
-        CircuitR        % 外电路电阻 (Ohm)
+        WindingObj      % 绕组对象
+        CircuitR        % 外电路电阻
         
-        % --- 非线性迭代控制 ---
-        MaxIter = 50        % 最大牛顿迭代次数
-        Tolerance = 1e-4    % 收敛容差 (相对残差)
+        % --- 迭代控制 ---
+        MaxIter = 50
+        Tolerance = 1e-4
         
-        % --- 线搜索控制 ---
-        MaxBacktracks = 20  % 线搜索最大回溯次数
-        BacktrackFactor = 0.5 % 步长衰减因子
-        MinStepSize = 1e-6    % 最小允许步长
+        % --- 线搜索 ---
+        MaxBacktracks = 20
+        BacktrackFactor = 0.5
+        MinStepSize = 1e-6
         
         % --- 正则化 ---
-        MatrixK_Add     % 附加刚度矩阵 (通常用于处理 Sigma=0 区域的奇异性)
+        MatrixK_Add     % 用于处理 Sigma=0 区域的奇异性
     end
     
     methods
-        function obj = HBFEMCoupledSolver(assembler, aft, winding, R)
+        function obj = DFTFEMCoupledSolver(assembler, aft, winding, R)
             % 构造函数
             obj.Assembler = assembler;
             obj.AFT = aft;
@@ -46,71 +43,65 @@ classdef HBFEMCoupledSolver < handle
             obj.CircuitR = R;
             
             % 初始化线性求解器
-            % 注意: HBFEM 耦合矩阵是非对称且复数的，必须正确配置 MUMPS
+            % DFTFEM 产生的矩阵规模较大且非对称，需优化配置
             obj.LinearSolver = LinearSolver('Auto');
-            obj.LinearSolver.MumpsICNTL.i14 = 100; % 增加内存预分配
+            % 必须设置为非对称模式 (0)
+            obj.LinearSolver.MumpsSymmetry = 0; 
+            % DFTFEM 填充率高，大幅增加内存预估 (400%)
+            obj.LinearSolver.MumpsICNTL.i14 = 400; 
         end
         
-        function [X_sol, I_sol, info] = solve(obj, space, matLibData, V_harmonics, fixedDofs, x0)
-            % SOLVE 执行场路耦合的非线性求解
+        function [X_sol, I_sol, info] = solve(obj, space, matLibData, V_spectrum, fixedDofs, x0)
+            % SOLVE 执行 DFT-FEM 求解
             %
             % 输入:
-            %   space:       有限元空间对象 (通常是 Nedelec)
-            %   matLibData:  材料属性库 (包含 B-H 曲线)
-            %   V_harmonics: [NumHarm x 1] 电压源的谐波相量向量 (已知激励)
-            %   fixedDofs:   Dirichlet 边界条件的自由度索引 (基波/直流等)
-            %   x0:          (可选) 初始解猜测 [NumDofs x NumHarm]
-            %
-            % 输出:
-            %   X_sol: [NumDofs x NumHarm] 收敛后的磁矢位谐波系数
-            %   I_sol: [NumHarm x 1] 收敛后的电流谐波相量
-            %   info:  求解过程信息 (迭代次数、收敛状态等)
+            %   V_spectrum: [NumHarm x 1] 电压源的频谱分量 (全频谱)
             
             fprintf('==============================================\n');
-            fprintf('   HBFEM Coupled Solver (Voltage Driven)      \n');
+            fprintf('   DFT-FEM Coupled Solver (Full Spectrum)     \n');
             fprintf('==============================================\n');
             
-            % 获取基础维度信息
-            numDofs = obj.Assembler.DofHandler.NumGlobalDofs;
+            % 1. 检查 DFTFEM 条件 (时频点数匹配)
+            % -----------------------------------------------------------
             numHarm = obj.AFT.NumHarmonics;
-            harmonics = obj.AFT.Harmonics;
-            baseFreq = obj.AFT.BaseFreq;
+            numTimeSteps = obj.AFT.NumTimeSteps;
+            maxHarm = max(obj.AFT.Harmonics);
             
-            % 计算总系统规模
-            totalFieldDofs = numDofs * numHarm;      % 场自由度总数
-            totalCircuitDofs = numHarm;              % 电路自由度总数 (电流)
-            totalSystemSize = totalFieldDofs + totalCircuitDofs;
+            % 理论上，实数 DFT 需要 N_t >= 2*max(H) + 1
+            % 如果由 AFT 自动生成，通常是满足的。这里仅做提示。
+            fprintf('   [Check] Harmonics: %d, TimeSteps: %d\n', numHarm, numTimeSteps);
+            if numTimeSteps > 4 * numHarm
+                fprintf(['   DFTFEM: Oversampling: ' ...
+                    '时域采样点远多于频域未知数，这更像是 HBFEM 而非标准 DFTFEM。建议检查 AFT 配置。\n']);
+            end
             
+            % 2. 基础初始化
             % -----------------------------------------------------------
-            % 1. 初始化变量
-            % -----------------------------------------------------------
+            numDofs = obj.Assembler.DofHandler.NumGlobalDofs;
+            totalFieldDofs = numDofs * numHarm;
+            totalCircuitDofs = numHarm;
+            
             if nargin < 6 || isempty(x0)
                 A_mat = zeros(numDofs, numHarm);
             else
                 A_mat = x0;
             end
-            I_vec = zeros(numHarm, 1); % 初始电流设为 0
+            I_vec = zeros(numHarm, 1);
             
-            % -----------------------------------------------------------
-            % 2. 预计算耦合向量 C
-            % -----------------------------------------------------------
-            % C_vec 是线圈的几何分布向量。物理上: J = (N/S) * I * dir
+            % 3. 预计算常数向量 C (线圈几何)
             C_vec = obj.Assembler.assembleWinding(space, obj.WindingObj);
             
+            % 4. 准备正则化矩阵 (Robust Regularization)
             % -----------------------------------------------------------
-            % 3. 准备正则化矩阵 (Regularization)
-            % -----------------------------------------------------------
-            % 对于非导电区域 (Sigma=0)，静态/低频 Maxwell 方程的 Curl-Curl 算子存在零空间。
-            % HBFEM 通常不引入 P 场，因此需要添加一个微小的质量矩阵项来消除奇异性。
             K_add_global = sparse(totalFieldDofs, totalFieldDofs);
             has_reg = ~isempty(obj.MatrixK_Add);
             if has_reg
-                fprintf('   [Info] Applying Regularization.\n');
+                fprintf('   [Info] Applying Regularization to eliminate singularity.\n');
                 M_small = obj.MatrixK_Add;
                 [mi, mj, mv] = find(M_small);
                 n_nz = length(mv);
                 
-                % 将正则化小矩阵扩展到所有谐波块的对角线上
+                % 扩展到所有频率块对角线
                 I_reg = zeros(n_nz * numHarm, 1);
                 J_reg = zeros(n_nz * numHarm, 1);
                 V_reg = zeros(n_nz * numHarm, 1);
@@ -124,170 +115,128 @@ classdef HBFEMCoupledSolver < handle
                 K_add_global = sparse(I_reg, J_reg, V_reg, totalFieldDofs, totalFieldDofs);
             end
             
-            % -----------------------------------------------------------
-            % 4. 扩展边界条件索引
-            % -----------------------------------------------------------
-            % 边界条件仅施加于场变量 A，电路变量 I 是自由的。
-            % 需要将基波的 BC 索引复制到所有高次谐波上。
+            % 5. 扩展边界条件
             Fixed_field = repmat(fixedDofs(:), numHarm, 1);
             Fixed_circuit = false(numHarm, 1); 
             Fixed_sys = [Fixed_field; Fixed_circuit];
             free_mask = ~Fixed_sys;
             
+            % 6. 初始残差与自动缩放 (Auto-Scaling)
             % -----------------------------------------------------------
-            % 5. 初始残差计算与自动缩放
-            % -----------------------------------------------------------
-            % 计算初始残差以确定系统的量级，用于后续的矩阵行缩放。
-            
-            % [场方程残差]: Res_F = K(A)*A - C*I
+            % 场方程残差
             [~, R_mag_mat] = obj.Assembler.assembleHBFEM(space, A_mat, obj.AFT, matLibData, false);
             R_mag_vec = R_mag_mat(:);
             
-            % 计算 C*I 项 (源电流贡献)
             F_current = zeros(totalFieldDofs, 1);
             for k = 1:numHarm
-                idx_s = (k-1)*numDofs + 1;
-                idx_e = k*numDofs;
+                idx_s = (k-1)*numDofs + 1; idx_e = k*numDofs;
                 F_current(idx_s:idx_e) = C_vec * I_vec(k);
             end
             
             Res_Field = R_mag_vec - F_current;
             if has_reg, Res_Field = Res_Field + K_add_global * A_mat(:); end
             
-            % [电路方程残差]: Res_C = R*I + jw*Psi - V
+            % 电路方程残差
             Res_Circuit = zeros(numHarm, 1);
+            harmonics_list = obj.AFT.Harmonics;
+            baseFreq = obj.AFT.BaseFreq;
+            
             for k = 1:numHarm
-                h = harmonics(k);
+                h = harmonics_list(k);
                 w = 2 * pi * baseFreq * h;
-                Psi_k = C_vec' * A_mat(:, k); % 磁链 Psi = Integral( A * J_unit ) dV
-                Res_Circuit(k) = obj.CircuitR * I_vec(k) + 1j * w * Psi_k - V_harmonics(k);
+                Psi_k = C_vec' * A_mat(:, k);
+                Res_Circuit(k) = obj.CircuitR * I_vec(k) + 1j * w * Psi_k - V_spectrum(k);
             end
             
-            % --- Auto-Scaling (自动缩放) ---
-            % 电路方程的量级 (V) 通常远小于场方程的量级 (A/m^2)，直接联立会导致矩阵病态。
-            % 计算缩放因子 row_scale，使两者残差量级接近。
+            % 计算缩放因子
             mag_scale = mean(abs(Res_Field)); if mag_scale < 1e-5, mag_scale = 1.0; end
             cir_scale_base = abs(obj.CircuitR); if cir_scale_base < 1e-10, cir_scale_base = 1.0; end
-            
             row_scale = mag_scale / cir_scale_base;
-            row_scale = min(max(row_scale, 1e3), 1e9); % 限制范围，防止过度缩放
+            row_scale = min(max(row_scale, 1e3), 1e9); 
             
             fprintf('   [Scaling] Circuit Row Scale Factor: %.2e\n', row_scale);
             
-            % 组合总残差向量 (应用缩放)
             Total_Res = [Res_Field; Res_Circuit * row_scale];
             current_res_norm = norm(Total_Res(free_mask));
             norm_base = current_res_norm; if norm_base < 1e-5, norm_base = 1.0; end
             
             fprintf('   Iter  0: Res=%.4e (Rel=%.4e)\n', current_res_norm, current_res_norm/norm_base);
             
-            res_history = current_res_norm;
             converged = false;
             
-            % -----------------------------------------------------------
-            % 6. 牛顿迭代主循环
+            % 7. 牛顿迭代循环
             % -----------------------------------------------------------
             for iter = 1:obj.MaxIter
-                % A. 组装场雅可比矩阵 (J_field)
-                %    这是最耗时的一步，计算非线性材料对各次谐波的交叉耦合项
+                % A. 组装场雅可比 (Dense Blocks in Frequency Domain)
                 [J_tri, R_mag_mat] = obj.Assembler.assembleHBFEM(space, A_mat, obj.AFT, matLibData, true);
                 J_field = sparse(J_tri.I, J_tri.J, J_tri.V, totalFieldDofs, totalFieldDofs);
                 
                 if has_reg, J_field = J_field + K_add_global; end
                 
-                % B. 构建场路耦合矩阵块 (Block Matrix Construction)
-                % 系统结构:
-                % [ J_field   -C   ]
-                % [ jwC^T      R   ]
-                
-                % 使用稀疏三元组构建耦合块，避免全矩阵操作
+                % B. 构建耦合块
                 [ci, ~, cv] = find(C_vec);
                 n_c = length(cv);
                 
                 TR_I = zeros(n_c * numHarm, 1); TR_J = zeros(n_c * numHarm, 1); TR_V = zeros(n_c * numHarm, 1);
                 BL_I = zeros(n_c * numHarm, 1); BL_J = zeros(n_c * numHarm, 1); BL_V = zeros(n_c * numHarm, 1);
-                
-                % 电路对角块 (电阻)
                 BR_I = (1:numHarm)'; BR_J = (1:numHarm)'; BR_V = ones(numHarm, 1) * obj.CircuitR * row_scale;
                 
                 for k = 1:numHarm
-                    h = harmonics(k);
+                    h = harmonics_list(k);
                     w = 2 * pi * baseFreq * h;
                     
-                    offset_field_row = (k-1)*numDofs;
-                    col_idx_circuit = k; 
-                    
+                    offset_field = (k-1)*numDofs;
+                    col_idx = k;
                     idx_rng = (k-1)*n_c + 1 : k*n_c;
                     
-                    % Top-Right Block: -C (电流源项)
-                    % 场方程对电流 I 的导数是 -C
-                    TR_I(idx_rng) = ci + offset_field_row;
-                    TR_J(idx_rng) = col_idx_circuit;
-                    TR_V(idx_rng) = -cv;
-                    
-                    % Bot-Left Block: jwC' * scale (感应电压项)
-                    % 电路方程对磁矢位 A 的导数是 jw * dPsi/dA = jw * C^T
-                    % 同样应用 row_scale 进行缩放
-                    BL_I(idx_rng) = col_idx_circuit;
-                    BL_J(idx_rng) = ci + offset_field_row;
-                    BL_V(idx_rng) = 1j * w * cv * row_scale;
+                    % Top-Right: -C
+                    TR_I(idx_rng) = ci + offset_field; TR_J(idx_rng) = col_idx; TR_V(idx_rng) = -cv;
+                    % Bot-Left: jwC' * scale
+                    BL_I(idx_rng) = col_idx; BL_J(idx_rng) = ci + offset_field; BL_V(idx_rng) = 1j * w * cv * row_scale;
                 end
                 
-                % 拼装四个子块
                 J_TR = sparse(TR_I, TR_J, TR_V, totalFieldDofs, totalCircuitDofs);
                 J_BL = sparse(BL_I, BL_J, BL_V, totalCircuitDofs, totalFieldDofs);
                 J_BR = sparse(BR_I, BR_J, BR_V, totalCircuitDofs, totalCircuitDofs);
                 
                 J_sys = [J_field, J_TR; J_BL, J_BR];
                 
-                % C. 更新残差 (Residual Update)
+                % C. 更新残差
                 R_mag_vec = R_mag_mat(:);
-                
-                % 更新 F_current (基于当前迭代的 I_vec)
                 F_current = zeros(totalFieldDofs, 1);
                 for k = 1:numHarm
                     idx_s = (k-1)*numDofs + 1; idx_e = k*numDofs;
                     F_current(idx_s:idx_e) = C_vec * I_vec(k);
                 end
-                
                 Res_Field = R_mag_vec - F_current;
                 if has_reg, Res_Field = Res_Field + K_add_global * A_mat(:); end
                 
                 Res_Circuit = zeros(numHarm, 1);
                 for k = 1:numHarm
-                    h = harmonics(k); w = 2 * pi * baseFreq * h;
+                    h = harmonics_list(k); w = 2 * pi * baseFreq * h;
                     Psi_k = C_vec' * A_mat(:, k);
-                    Res_Circuit(k) = obj.CircuitR * I_vec(k) + 1j * w * Psi_k - V_harmonics(k);
+                    Res_Circuit(k) = obj.CircuitR * I_vec(k) + 1j * w * Psi_k - V_spectrum(k);
                 end
-                
                 Total_Res = [Res_Field; Res_Circuit * row_scale];
                 
-                % D. 求解线性方程组 J * dx = -Res
+                % D. 求解
                 RHS = -Total_Res;
-                
-                % 应用 Dirichlet 边界条件 (置 1 对角线，置 0 右端项)
                 [J_solve, R_solve] = BoundaryCondition.applyDirichlet(J_sys, RHS, Fixed_sys);
-                
-                % 调用求解器
                 dX_sys = obj.LinearSolver.solve(J_solve, R_solve);
                 
-                % 分离解增量
                 dA_vec = dX_sys(1:totalFieldDofs);
                 dI_vec = dX_sys(totalFieldDofs+1:end);
-                
                 dA_mat = reshape(dA_vec, numDofs, numHarm);
                 
                 % E. 线搜索 (Line Search)
-                % 防止在强非线性区域步长过大导致发散
                 alpha = 1.0;
                 accepted = false;
                 
                 for bt = 0:obj.MaxBacktracks
-                    % 试探步
                     A_try = A_mat + alpha * dA_mat;
                     I_try = I_vec + alpha * dI_vec;
                     
-                    % 快速计算试探步残差 (只计算向量，不组装 Jacobian，速度快)
+                    % Fast Residual Check
                     [~, R_mag_try] = obj.Assembler.assembleHBFEM(space, A_try, obj.AFT, matLibData, false);
                     R_vec_try = R_mag_try(:);
                     
@@ -296,55 +245,45 @@ classdef HBFEMCoupledSolver < handle
                         idx_s = (k-1)*numDofs + 1; idx_e = k*numDofs;
                         F_curr_try(idx_s:idx_e) = C_vec * I_try(k);
                     end
-                    
                     Res_F_try = R_vec_try - F_curr_try;
                     if has_reg, Res_F_try = Res_F_try + K_add_global * A_try(:); end
                     
                     Res_C_try = zeros(numHarm, 1);
                     for k = 1:numHarm
-                        h = harmonics(k); w = 2*pi*baseFreq*h;
+                        h = harmonics_list(k); w = 2*pi*baseFreq*h;
                         Psi_k = C_vec' * A_try(:, k);
-                        Res_C_try(k) = obj.CircuitR * I_try(k) + 1j * w * Psi_k - V_harmonics(k);
+                        Res_C_try(k) = obj.CircuitR * I_try(k) + 1j * w * Psi_k - V_spectrum(k);
                     end
                     
                     Total_Res_try = [Res_F_try; Res_C_try * row_scale];
                     new_res_norm = norm(Total_Res_try(free_mask));
                     
-                    % 判断准则: 残差减小
                     if new_res_norm < current_res_norm || alpha < obj.MinStepSize
-                        % 接受步长
                         A_mat = A_try;
                         I_vec = I_try;
                         current_res_norm = new_res_norm;
                         accepted = true;
-                        
                         marker = ''; if bt>0, marker=sprintf('[BT %d]', bt); end
                         fprintf('   Iter %d: Res=%.2e (Rel=%.2e) Step=%.4f %s\n', ...
                             iter, current_res_norm, current_res_norm/norm_base, alpha, marker);
                         break;
                     else
-                        % 拒绝步长，回溯
                         alpha = alpha * obj.BacktrackFactor;
                     end
                 end
                 
-                % 线搜索失败保护 (强制更新，防止死锁)
                 if ~accepted
                     warning('Line search stuck. Forcing step.');
                     A_mat = A_mat + 1e-3 * dA_mat;
                     I_vec = I_vec + 1e-3 * dI_vec;
                 end
                 
-                % 收敛判断
                 if current_res_norm / norm_base < obj.Tolerance
                     converged = true;
                     break;
                 end
             end
             
-            % -----------------------------------------------------------
-            % 7. 整理输出
-            % -----------------------------------------------------------
             X_sol = A_mat;
             I_sol = I_vec;
             info.Iterations = iter;

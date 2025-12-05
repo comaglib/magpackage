@@ -1,6 +1,7 @@
 function uninstall
     baseDir = fileparts(mfilename('fullpath'));
     rmpath(genpath(fullfile(baseDir, 'src')));
+    rmpath(genpath(fullfile(baseDir, 'data')));
     rmpath(genpath(fullfile(baseDir, 'tests')));
     rmpath(genpath(fullfile(baseDir, 'tutorials')));
     rmpath(fullfile(baseDir, 'bin')); 
