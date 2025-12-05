@@ -16,7 +16,7 @@ fprintf('=========================================================\n');
 
 %% --- 1. 初始化与网格加载 ---
 % 加载四面体网格文件，单位转换为毫米
-meshFile = 'data/meshData/Team7.mphtxt';
+meshFile = 'data/Team7.mphtxt';
 fprintf('[Step 1] Loading Mesh from: %s (Unit: mm)\n', meshFile);
 if ~exist(meshFile, 'file'), error('Mesh file not found: %s', meshFile); end
 

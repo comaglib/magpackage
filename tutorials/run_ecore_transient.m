@@ -22,7 +22,7 @@ fprintf('[Step 1] Loading Mesh and Geometry...\n');
 
 % 1.1 加载网格
 % 网格文件包含四面体单元信息。'm' 表示单位为米。
-meshFile = 'data/meshData/Ecore.mphtxt';
+meshFile = 'data/Ecore.mphtxt';
 if ~exist(meshFile, 'file'), error('Mesh file not found'); end
 mesh = Mesh.load(meshFile, 'm'); 
 

@@ -16,7 +16,7 @@ fprintf('=========================================================\n');
 
 %% --- 1. 初始化与网格加载 ---
 % 加载 COMSOL 格式网格文件，单位转换为米
-meshFile = 'data/meshData/Ecore.mphtxt';
+meshFile = 'data/Ecore.mphtxt';
 if ~exist(meshFile, 'file'), error('Mesh file not found'); end
 mesh = Mesh.load(meshFile, 'm'); 
 mesh.generateEdges(); % 生成棱边拓扑数据 (用于 Nedelec 单元)

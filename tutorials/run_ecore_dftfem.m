@@ -17,7 +17,7 @@ fprintf('=========================================================\n');
 
 %% --- 1. 初始化与网格加载 ---
 % (与 run_ecore_hbfem 保持一致)
-meshFile = 'data/meshData/Ecore.mphtxt';
+meshFile = 'data/Ecore.mphtxt';
 if ~exist(meshFile, 'file'), error('Mesh file not found'); end
 mesh = Mesh.load(meshFile, 'm'); 
 mesh.generateEdges();
