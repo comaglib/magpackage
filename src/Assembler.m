@@ -18,7 +18,6 @@ classdef Assembler < handle
             end
         end
         
-        % 1. assembleStiffness
         function K = assembleStiffness(obj, space, materialMap)
             packedData = obj.preparePackedData(space);
             packedData.Nu = obj.expandMaterialMap(materialMap, obj.Mesh.RegionTags);
@@ -34,7 +33,6 @@ classdef Assembler < handle
             K = sparse(I(valid), J(valid), V(valid), obj.DofHandler.NumGlobalDofs, obj.DofHandler.NumGlobalDofs);
         end
         
-        % 2. assembleMass
         function M = assembleMass(obj, space)
             packedData = obj.preparePackedData(space);
             if strcmpi(space.Type, 'Nedelec')
@@ -53,7 +51,6 @@ classdef Assembler < handle
             end
         end
         
-        % 3. assembleMassWeighted
         function M = assembleMassWeighted(obj, space, coeffMap)
             packedData = obj.preparePackedData(space);
             packedData.Coeff = obj.expandMaterialMap(coeffMap, obj.Mesh.RegionTags);
@@ -73,7 +70,6 @@ classdef Assembler < handle
             end
         end
         
-        % 4. assembleSource
         function F = assembleSource(obj, space, sourceMap)
             packedData = obj.preparePackedData(space);
             packedData.RegionTags = obj.Mesh.RegionTags;
@@ -95,7 +91,6 @@ classdef Assembler < handle
             end
         end
         
-        % 5. assembleCoupling
         function C = assembleCoupling(obj, spaceRow, spaceCol, coeffMap)
             packedRow = obj.preparePackedData(spaceRow); 
             packedCol = obj.preparePackedData(spaceCol); 
@@ -118,7 +113,6 @@ classdef Assembler < handle
             end
         end
         
-        % 6. assembleScalarLaplacian
         function K = assembleScalarLaplacian(obj, space, coeffMap)
             packedData = obj.preparePackedData(space);
             packedData.Coeff = obj.expandMaterialMap(coeffMap, obj.Mesh.RegionTags);
@@ -132,7 +126,6 @@ classdef Assembler < handle
             K = sparse(I(valid), J(valid), V(valid), obj.DofHandler.NumGlobalDofs, obj.DofHandler.NumGlobalDofs);
         end
         
-        % 7. assembleWinding
         function C = assembleWinding(obj, space, windingObj)
             packedData = obj.preparePackedData(space); packedData.RegionTags = obj.Mesh.RegionTags;
             if exist('assemble_winding_kernel_mex', 'file') == 3
@@ -147,7 +140,6 @@ classdef Assembler < handle
             end
         end
         
-        % 8. Jacobian
         function [J_mat, R_mat] = assembleJacobian(obj, space, solutionA, matLibData, calcJ)
             if nargin < 5, calcJ = true; end
             packedData = obj.preparePackedData(space);
@@ -194,7 +186,6 @@ classdef Assembler < handle
             end
         end
         
-        % 9. HBFEM
         function [J_triplets, Res_mat] = assembleHBFEM(obj, space, solHarmonics, aftObj, matLibData, calcJ)
             if nargin < 6, calcJ = true; end
             packedData = obj.preparePackedData(space);

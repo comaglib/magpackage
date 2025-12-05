@@ -1,7 +1,7 @@
 % run_ecore_transient.m - E-Core Transformer Transient Benchmark
 % 
 % 描述:
-%   模拟 E 型变压器在正弦电压源激励下的瞬态响应（场路耦合）。
+%   模拟 E 型变压器在正弦电压源激励下的瞬态响应（场路耦合）
 
 clear; clc; tic;
 
@@ -59,6 +59,9 @@ space_A = FunctionSpace('Nedelec', 1);
 dofHandler = DofHandler(mesh);
 dofHandler.distributeDofs(space_A);
 
+space_P = FunctionSpace('Lagrange', 1);
+dofHandler.distributeDofs(space_P);
+
 %% --- 3. 线圈与电路耦合设置 ---
 fprintf('[Step 3] Setup Field-Circuit Coupling...\n');
 
@@ -84,20 +87,24 @@ circuit.V_source_func = @(t) 76 * sin(2 * pi * 50 * t);
 assembler = Assembler(mesh, dofHandler);
 solver = TransientCoupledSolver(assembler);
 solver.Tolerance = 1e-2;
+solver.RelTolerance = 1e-2;
 solver.LinearSolver.MumpsSymmetry = 0;
 solver.LinearSolver.MumpsICNTL.i14 = 300;
 
 dt = 5e-4;
-timeSteps = repmat(dt, round(0.01/dt), 1);
+timeSteps = repmat(dt, round(0.04/dt), 1);
 
 fixedDofs_A = BoundaryCondition.findOuterBoundaryDofs(mesh, dofHandler, space_A);
+fixedDofs_P = BoundaryCondition.findOuterBoundaryDofs(mesh, dofHandler, space_P);
+
+plotFunc = @(t, I, t_vec, I_vec) plot(t_vec, I_vec, 'r-o', 'LineWidth', 1.5); grid on;
 
 %% --- 5. 求解 ---
 fprintf('[Step 5] Solving...\n');
 
-[sols, info] = solver.solve(space_A, matLib, sigmaMap, ...
+[sols, info] = solver.solve(space_A, space_P, matLib, sigmaMap, ...
                             circuit, winding, timeSteps, ...
-                            fixedDofs_A, []);
+                            fixedDofs_A, fixedDofs_P, [], plotFunc);
 
 %% --- 6. 后处理 ---
 fprintf('[Step 6] Post-Processing...\n');
