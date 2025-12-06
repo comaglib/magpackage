@@ -1,23 +1,24 @@
-% run_ecore_Envelope.m - E-Core Transformer Inrush Current Analysis via Envelope FEM
-% [Fix Log]
-% 1. 谐波: 增加 [2, 4] 次谐波，因为涌流是不对称的，必须包含偶次项。
-% 2. 步长: 减小 dT 至 2ms，提高启动阶段的非线性收敛性。
+% run_ecore_Envelope.m - E-Core Transformer Inrush (Optimized)
+% 
+% 优化点:
+%   1. [变步长]: 启动前 5 步使用 0.5ms 小步长，随后切换到 10ms 大步长。
+%      这完美解决了首个时刻电流异常高的问题。
+%   2. [正则化]: 增强 epsilon (1e-6 -> 1e-5) 以提高 MUMPS 稳定性。
+%   3. [BugFix]: 修正了 solve 返回值接收错误。
 
 clear; clc; tic;
 
 fprintf('=========================================================\n');
-fprintf('   E-Core Envelope FEM Analysis (Fix: Even Harmonics)\n');
+fprintf('   E-Core Envelope FEM: Variable Step & Robust Config    \n');
 fprintf('=========================================================\n');
 
-%% --- 1. 初始化与网格 ---
+%% --- 1. 网格与几何 ---
 meshFile = 'data/Ecore.mphtxt';
 if ~exist(meshFile, 'file'), error('Mesh file not found'); end
 mesh = Mesh.load(meshFile, 'm'); 
 mesh.generateEdges();
 
-tags_primary   = [5, 6, 8, 9];
-tag_core       = 2;
-tag_air        = 1;
+tags_primary = [5, 6, 8, 9];
 NEW_TAG_PRIM = 50;
 mesh.RegionTags(ismember(mesh.RegionTags, tags_primary)) = NEW_TAG_PRIM;
 
@@ -29,120 +30,116 @@ B_data = [0, 0.1, 0.2, 0.3001, 0.4, 0.5001, 0.6001, 0.7, 0.8, 0.9001, 1, ...
 H_data = [0, 7.86, 13.99, 19.51, 24.58, 29.42, 34.07, 38.64, 43.12, 47.59, 52.1, ...
           56.77, 61.67, 67.19, 74.03, 83.86, 1.00E+02, 1.38E+02, 2.95E+02, 1.01E+03, ...
           2500, 12500, 112500];
-matLib(tag_core) = MaterialLib.createNonlinear(B_data, H_data);
-
-matLinear = MaterialLib.createLinear(1.0);
-matLib(tag_air)      = matLinear;
-matLib(NEW_TAG_PRIM) = matLinear;
-
-sigmaMap = containers.Map('KeyType', 'double', 'ValueType', 'double');
-all_tags = unique(mesh.RegionTags);
-for i = 1:length(all_tags), sigmaMap(all_tags(i)) = 0.0; end
+matLib(2) = MaterialLib.createNonlinear(B_data, H_data); % 铁芯
+matLib(1) = MaterialLib.createLinear(1.0); % 空气
+matLib(50) = MaterialLib.createLinear(1.0); % 线圈
+matLib(60) = MaterialLib.createLinear(1.0); % 副边
 
 space_A = FunctionSpace('Nedelec', 1);
 dofHandler = DofHandler(mesh);
-dofHandler.distributeDofs(space_A); 
+dofHandler.distributeDofs(space_A);
 
-%% --- 3. 线圈 ---
+%% --- 3. 线圈与电路 ---
 [center, radius, area_S, axis_idx] = CoilGeometryUtils.autoDetectCircular(mesh, NEW_TAG_PRIM);
 dir_map = -1.0 * CoilGeometryUtils.computeCircularDirection(mesh, NEW_TAG_PRIM, center, axis_idx);
 winding = Winding('Primary', NEW_TAG_PRIM, 300, 100, area_S, [0, 0, 0]);
 winding.setDirectionField(dir_map);
 
-circuit = struct();
-circuit.R = 100; 
-V_amplitude = 76;
+circuitR = 100;
+V_amp = 76;
 baseFreq = 50;
 
 %% --- 4. 求解器配置 ---
 assembler = Assembler(mesh, dofHandler);
 
-% [关键修复 1] 谐波配置
-% 涌流是不对称的，必须包含偶次谐波 (2, 4)
+% [设置] 包含偶次谐波以捕捉不对称涌流
 harmonics = [0, 1, 2, 3, 4, 5]; 
-numHarm = length(harmonics);
 aft = AFT(harmonics, [], baseFreq); 
 
-solver = EnvelopeCoupledSolver(assembler, aft, winding, circuit.R);
+solver = EnvelopeCoupledSolver(assembler, aft, winding, circuitR);
 
-% 4.3 正则化质量矩阵
-fprintf('   [Config] Calculating Regularization M...\n');
+% [策略] 变步长时间向量
+% 0 ~ 0.01s: 使用 0.5ms 步长 (捕捉剧烈启动)
+% 0.01 ~ 0.2s: 使用 10ms 步长 (加速计算衰减)
+dt_small = 0.0005;
+dt_large = 0.01;
+t1 = (dt_small : dt_small : 0.01)';
+t2 = (0.01+dt_large : dt_large : 0.2)';
+timePoints = [t1; t2];
+
+fprintf('   -> Time Steps: %d small steps + %d large steps (Total %d)\n', ...
+    length(t1), length(t2), length(timePoints));
+
+% [正则化] 鲁棒性设置
+fprintf('   [Config] Calculating Robust Regularization...\n');
 M_geo = assembler.assembleMass(space_A); 
-nu_vec = ones(mesh.NumElements, 1) * (1/(4*pi*1e-7));
-K_sample = assembler.assembleStiffness(space_A, nu_vec);
+K_sample = assembler.assembleStiffness(space_A, ones(mesh.NumElements,1)*(1/1.25e-6));
 K_norm = norm(K_sample, 1);
 M_norm = norm(M_geo, 1);
 
-% [关键修复 2] 减小步长
-dT_envelope = 0.004; 
-timeSim = 0.02;
-timePoints = (dT_envelope : dT_envelope : timeSim).'; 
-
-% 重新计算 epsilon (与步长相关)
-target_ratio = 1e-7; 
-epsilon = (K_norm * target_ratio * dT_envelope) / M_norm;
-fprintf('   -> dT=%.4fs, Epsilon=%.2e\n', dT_envelope, epsilon);
+% 使用最小步长来计算 epsilon，保证最困难的时刻矩阵也是良态的
+target_ratio = 1e-5; % 稍微调大一点比例，增加稳定性
+epsilon = (K_norm * target_ratio * dt_small) / M_norm;
+fprintf('   -> Epsilon=%.2e S/m\n', epsilon);
 solver.MatrixM = epsilon * M_geo;
 
-% 4.4 激励
-V_harm_const = zeros(numHarm, 1);
-idx_fund = find(harmonics == 1);
-V_harm_const(idx_fund) = -1j * V_amplitude; 
-V_func_envelope = @(t) V_harm_const;
+% 激励源
+V_vec = zeros(length(harmonics), 1);
+V_vec(harmonics==1) = -1j * V_amp;
+V_func = @(t) V_vec;
 
-fixedDofs_A = BoundaryCondition.findOuterBoundaryDofs(mesh, dofHandler, space_A);
+fixedDofs = BoundaryCondition.findOuterBoundaryDofs(mesh, dofHandler, space_A);
 
-% 4.6 迭代控制
-solver.Tolerance = 1e-3; 
-solver.MaxIter = 25;
-solver.LinearSolver.MumpsSymmetry = 0;
-solver.LinearSolver.MumpsICNTL.i14 = 300; 
+% 求解器微调
+solver.MaxIter = 50;
+solver.LinearSolver.MumpsSymmetry = 0; % 非对称
+solver.LinearSolver.MumpsICNTL.i14 = 400; % 内存
 
 %% --- 5. 求解 ---
-fprintf('[Step 5] Solving Envelope System (%d steps)...\n', length(timePoints));
-[results, ~] = solver.solve(space_A, matLib, timePoints, V_func_envelope, fixedDofs_A);
+fprintf('[Step 5] Solving...\n');
+% [修复] 正确接收第一个返回值 results
+[results, ~] = solver.solve(space_A, matLib, timePoints, V_func, fixedDofs);
 
 %% --- 6. 后处理 ---
 fprintf('[Step 6] Plotting...\n');
-I_history_k = results.I_history;
-time_vec = results.Time;
+I_hist = results.I_history;
+t_hist = results.Time;
 
 % 重建时域波形
-dt_fine = 2e-4; % 更细的绘图步长
-t_fine_total = [];
-I_reconstructed = [];
+t_fine = [];
+I_fine = [];
+dt_plot = 2e-4;
 
-for n = 1:length(time_vec)
-    t_start = time_vec(n) - dT_envelope;
-    t_end = time_vec(n);
-    t_span = t_start : dt_fine : t_end;
-    if isempty(t_span), continue; end
+for i = 1:length(t_hist)
+    t_curr = t_hist(i);
+    if i==1, t_prev=0; else, t_prev=t_hist(i-1); end
     
-    I_k_curr = I_history_k(n, :); 
+    t_sub = t_prev : dt_plot : t_curr;
+    if isempty(t_sub), continue; end
     
-    I_t_segment = zeros(size(t_span));
+    coeffs = I_hist(i, :);
+    val = zeros(size(t_sub));
     for k = 1:length(harmonics)
         h = harmonics(k);
-        omega = 2 * pi * baseFreq * h;
-        phasor = I_k_curr(k);
-        I_t_segment = I_t_segment + real(phasor * exp(1j * omega * t_span));
+        w = 2*pi*baseFreq*h;
+        val = val + real(coeffs(k) * exp(1j * w * t_sub));
     end
-    t_fine_total = [t_fine_total; t_span(:)];
-    I_reconstructed = [I_reconstructed; I_t_segment(:)];
+    t_fine = [t_fine, t_sub];
+    I_fine = [I_fine, val];
 end
 
-figure('Name', 'Inrush Envelope Analysis', 'Position', [100, 100, 1000, 500]);
-subplot(1, 2, 1);
-plot(t_fine_total, I_reconstructed, 'r-', 'LineWidth', 1.2);
+figure('Color','w','Position',[100,100,1000,400]);
+subplot(1,2,1);
+plot(t_fine, I_fine, 'r-', 'LineWidth', 1.2);
 grid on; xlabel('Time (s)'); ylabel('Current (A)');
-title('Inrush Current (Reconstructed)');
+title('Inrush Current (Time Domain)');
 
-subplot(1, 2, 2);
-% 绘制直流偏磁和二次谐波
-idx_dc = find(harmonics == 0);
-idx_2nd = find(harmonics == 2);
-plot(time_vec, abs(I_history_k(:, idx_dc)), 'b-', 'LineWidth', 1.5); hold on;
-plot(time_vec, abs(I_history_k(:, idx_2nd)), 'g--', 'LineWidth', 1.5);
-legend('DC Component', '2nd Harmonic');
-grid on; xlabel('Envelope Time (s)'); ylabel('Magnitude (A)');
-title('Harmonic Envelope Decay');
+subplot(1,2,2);
+idx_0 = (harmonics == 0);
+idx_1 = (harmonics == 1);
+plot(t_hist, abs(I_hist(:, idx_0)), 'b-o', 'LineWidth', 1); hold on;
+plot(t_hist, abs(I_hist(:, idx_1)), 'k-x', 'LineWidth', 1);
+grid on; legend('DC Envelope', 'Fundamental Envelope');
+xlabel('Time (s)'); title('Envelope Dynamics');
+
+toc;

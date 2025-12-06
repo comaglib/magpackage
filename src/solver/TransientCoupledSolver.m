@@ -268,7 +268,7 @@ classdef TransientCoupledSolver < handle
                         % 调用回调函数
                         monitorHandle(currentTime, x_curr(end), t_vec, I_vec);
                         grid on;
-                        drawnow limitrate; % 强制刷新图形窗口 (limitrate 限制刷新率以保证性能)
+                        drawnow; % 强制刷新图形窗口 (limitrate 限制刷新率以保证性能)
                     catch ME
                         fprintf('Monitor handle execution failed: %s', ME.message);
                     end

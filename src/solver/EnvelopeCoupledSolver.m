@@ -17,7 +17,7 @@ classdef EnvelopeCoupledSolver < handle
         CircuitR        
         
         % --- 迭代控制 ---
-        MaxIter = 50        
+        MaxIter = 25        
         Tolerance = 1e-4    
         
         % --- LM 算法参数 ---
