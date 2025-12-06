@@ -195,7 +195,6 @@ B_core = post.combineRegionData(B_nodes, tag_core);
 % 在铁芯表面绘制 B 模值云图
 viz.plotFieldOnSurface(tag_core, B_core(:), 'FaceAlpha', 1.0, 'EdgeColor', 'none');
 title(sprintf('|B| Magnitude at t=%.3fs', time_vec(end)));
-colorbar;
 view(3); axis equal;
 
 toc;
