@@ -1,5 +1,5 @@
 classdef TransientCoupledSolver < handle
-    % TRANSIENTCOUPLEDSOLVER 场路耦合非线性瞬态求解器 (v7.12 - Full Commented)
+    % TRANSIENTCOUPLEDSOLVER 场路耦合非线性瞬态求解器 (v7.14 - B-Field Probe Support)
     % 
     % 描述:
     %   本类实现了二维/三维瞬态磁场与外电路的强耦合求解。
@@ -14,7 +14,7 @@ classdef TransientCoupledSolver < handle
     %   4. 数值调理: 采用 "GeoBalance" (几何平衡) 策略自动计算电路方程的缩放因子，
     %               平衡铁芯(软)与空气(硬)的刚度差异，防止矩阵病态。
     %   5. 全局收敛: 内置自适应回溯线搜索 (Backtracking Line Search)，防止迭代发散。
-    %   6. 实时监控: 支持通过 monitorHandle 回调函数在迭代过程中实时绘制曲线。
+    %   6. 实时监控: 支持通过 monitorHandle 回调函数在迭代过程中实时绘制电流及磁密曲线。
     
     properties
         Assembler       % 有限元组装器对象 (负责计算单元刚度、质量矩阵、耦合项等)
@@ -51,7 +51,8 @@ classdef TransientCoupledSolver < handle
                                                  timeSteps, ...
                                                  fixedDofs_A, fixedDofs_P, ...
                                                  init_State, ...
-                                                 monitorHandle)
+                                                 monitorHandle, ...
+                                                 probePoint)
             % SOLVE 执行瞬态求解主循环
             %
             % 输入参数:
@@ -64,10 +65,13 @@ classdef TransientCoupledSolver < handle
             %   timeSteps:    时间步长数组 [dt1, dt2, ...]
             %   fixedDofs_*:  边界条件 (Dirichlet) 的自由度索引
             %   init_State:   初始状态向量 (可选，用于续算)
-            %   monitorHandle:(可选) 回调函数句柄 @(t, I, t_hist, I_hist)，用于实时绘图
+            %   monitorHandle:(可选) 回调函数句柄，用于实时绘图。
+            %                 格式 1 (仅电流): @(t, I, t_vec, I_vec)
+            %                 格式 2 (电流+磁密): @(t, I, t_vec, I_vec, B, B_vec)
+            %   probePoint:   (可选) [x, y, z] 磁密探测点坐标。若提供，将计算该点 |B|。
             
             fprintf('==================================================\n');
-            fprintf('   Transient Solver (v7.12 Newton + Monitor)      \n');
+            fprintf('   Transient Solver (v7.14 Newton + Probe)        \n');
             fprintf('==================================================\n');
             
             dofHandler = obj.Assembler.DofHandler;
@@ -90,8 +94,19 @@ classdef TransientCoupledSolver < handle
             ctx.matLib = matLib;
             ctx.circuit = circuitProps;
             
-            % 处理可选参数 monitorHandle
+            % 处理可选参数
             if nargin < 12, monitorHandle = []; end
+            if nargin < 13, probePoint = []; end
+            
+            % 初始化磁密探测器 (如果提供了探测点)
+            postProc = [];
+            probeB_History = [];
+            if ~isempty(probePoint)
+                fprintf('   [Init] Initializing B-Field Probe at [%.3f, %.3f, %.3f]...\n', ...
+                    probePoint(1), probePoint(2), probePoint(3));
+                postProc = PostProcessor(obj.Assembler);
+                probeB_History = zeros(length(timeSteps), 1);
+            end
             
             % --------------------------------------------------
             % 2. 组装时不变矩阵 (Invariant Matrices)
@@ -258,15 +273,41 @@ classdef TransientCoupledSolver < handle
                 solutionResults = x_curr;
                 currentHistory(t_idx) = x_curr(end);
                 
-                % [实时监控] 调用用户传入的句柄进行绘图
+                % --- [关键修改] 磁密探针计算 ---
+                B_mag_current = 0;
+                if ~isempty(postProc)
+                    % 提取 A 场部分 (前 num_A 个自由度)
+                    A_sol_step = x_curr(1:ctx.num_A);
+                    % 计算探测点的 B 矢量
+                    B_vec = postProc.probeB(A_sol_step, probePoint);
+                    % 计算模值 |B|
+                    B_mag_current = norm(B_vec);
+                    probeB_History(t_idx) = B_mag_current;
+                    fprintf('    [Probe] |B| at [%.2f,%.2f,%.2f] = %.4f T\n', ...
+                        probePoint(1), probePoint(2), probePoint(3), B_mag_current);
+                end
+                
+                % --- [关键修改] 实时监控与绘图 ---
                 if ~isempty(monitorHandle)
                     try
                         % 构造累积时间轴和电流历史
                         t_vec = cumsum(timeSteps(1:t_idx));
                         I_vec = currentHistory(1:t_idx);
                         
-                        % 调用回调函数
-                        monitorHandle(currentTime, x_curr(end), t_vec, I_vec);
+                        % 智能调用逻辑:
+                        % 1. 如果存在探针数据 (postProc 非空) 且 用户句柄支持 6 个参数:
+                        %    -> 传递 B 场数据，实现同步绘图。
+                        % 2. 否则:
+                        %    -> 仅传递电流数据 (保持旧代码兼容性)。
+                        if ~isempty(postProc) && nargin(monitorHandle) >= 6
+                            B_vec_hist = probeB_History(1:t_idx);
+                            % 调用扩展接口: (t, I, t_vec, I_vec, B_curr, B_hist)
+                            monitorHandle(currentTime, x_curr(end), t_vec, I_vec, B_mag_current, B_vec_hist);
+                        else
+                            % 调用基础接口: (t, I, t_vec, I_vec)
+                            monitorHandle(currentTime, x_curr(end), t_vec, I_vec);
+                        end
+                        
                         grid on;
                         drawnow; % 强制刷新图形窗口 (limitrate 限制刷新率以保证性能)
                     catch ME
@@ -277,6 +318,9 @@ classdef TransientCoupledSolver < handle
             
             info.FinalTime = currentTime; 
             info.CurrentHistory = currentHistory;
+            if ~isempty(postProc)
+                info.ProbeB_History = probeB_History; % 输出 B 场历史数据
+            end
         end
     end
     

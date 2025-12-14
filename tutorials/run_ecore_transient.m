@@ -3,7 +3,7 @@
 % 描述:
 %   本脚本模拟 E 型变压器在正弦电压源激励下的瞬态响应。
 %   这是一个典型的场路耦合(Field-Circuit Coupled)问题。
-%
+% 
 % 物理模型特征:
 %   1. 几何: E 型铁芯 + 跑道型/圆形线圈。
 %   2. 材料: 铁芯采用非线性 B-H 曲线 (模拟饱和效应)。
@@ -101,16 +101,19 @@ fprintf('   -> Coil Config: R=%.4fm, Clockwise Direction Set.\n', radius);
 
 % 3.3 创建绕组对象
 % 定义物理属性：匝数=300, 直流电阻=100欧姆
-winding = Winding('Primary', NEW_TAG_PRIM, 300, 100, area_S, [0, 0, 0]);
+NP = 3000;
+RP = 10;
+winding = Winding('Primary', NEW_TAG_PRIM, NP, RP, area_S, [0, 0, 0]);
 winding.setDirectionField(dir_map); % 赋予空间分布的方向场
 
 % 3.4 外电路定义 (Netlist)
 % 电路方程: V_source(t) = i(t)*R + L*di/dt + dPsi/dt (感应电动势)
 circuit = struct();
-circuit.R = 100; % 外电路串联电阻
+circuit.R = RP;  % 外电路串联电阻
 circuit.L = 0;   % 外电路串联电感 (不包括线圈自感)
 % 定义电压源函数 (50Hz 正弦波, 幅值 76V)
-circuit.V_source_func = @(t) 76 * sin(2 * pi * 50 * t);
+Vamp = 500;
+circuit.V_source_func = @(t) Vamp * sin(2 * pi * 50 * t);
 
 %% --- 4. 求解器配置 ---
 fprintf('[Step 4] Configuring Solver...\n');
@@ -128,8 +131,8 @@ solver.LinearSolver.MumpsSymmetry = 0;
 solver.LinearSolver.MumpsICNTL.i14 = 300; % 增加内存预分配以防溢出
 
 % 4.3 时间步进设置
-dt = 5e-4;        % 时间步长
-timeSim = 0.01;   % 模拟时长，观察启动瞬态
+dt = 5e-4;         % 时间步长
+timeSim = 0.1-dt;  % 模拟时长，观察启动瞬态
 timeSteps = repmat(dt, round(timeSim/dt), 1);
 
 % 4.4 边界条件 (Dirichlet)
@@ -138,8 +141,12 @@ fixedDofs_A = BoundaryCondition.findOuterBoundaryDofs(mesh, dofHandler, space_A)
 fixedDofs_P = BoundaryCondition.findOuterBoundaryDofs(mesh, dofHandler, space_P);
 
 % 4.5 实时绘图回调
-% 在计算过程中实时绘制电流波形
-plotFunc = @(t, I, t_vec, I_vec) plot(t_vec, I_vec, 'r-o', 'LineWidth', 1.5); grid on;
+% 定义磁密探测点 (例如选在铁芯柱中心 [0,0,0] 或其他感兴趣的位置)
+probePoint = [0, 0, 0];
+
+% 定义绘图回调函数句柄
+% 注意: 求解器会自动传入 (t, I, t_vec, I_vec, B_curr, B_hist)
+plotFunc = @(t, I, t_vec, I_vec, B_curr, B_hist) monitor_callback(t, I, t_vec, I_vec, B_curr, B_hist);
 
 %% --- 5. 求解 ---
 fprintf('[Step 5] Solving Transient System...\n');
@@ -148,7 +155,7 @@ fprintf('[Step 5] Solving Transient System...\n');
 % solve 方法会自动处理时间步进、非线性牛顿迭代及场路耦合更新
 [sols, info] = solver.solve(space_A, space_P, matLib, sigmaMap, ...
                             circuit, winding, timeSteps, ...
-                            fixedDofs_A, fixedDofs_P, [], plotFunc);
+                            fixedDofs_A, fixedDofs_P, [], plotFunc, probePoint);
 
 %% --- 6. 后处理 ---
 fprintf('[Step 6] Post-Processing...\n');
@@ -198,3 +205,38 @@ title(sprintf('|B| Magnitude at t=%.3fs', time_vec(end)));
 view(3); axis equal;
 
 toc;
+
+%% --- 辅助局部函数 (请将此函数放在脚本的最末尾) ---
+function monitor_callback(t, I, t_vec, I_vec, B_curr, B_hist)
+    % 创建或激活图形窗口
+    persistent hFig;
+    if isempty(hFig) || ~isvalid(hFig)
+        hFig = figure('Name', 'Real-time Monitor', 'Position', [100, 100, 800, 600]);
+    end
+    set(0, 'CurrentFigure', hFig);
+
+    % --- 子图 1: 电流波形 ---
+    subplot(2, 1, 1);
+    plot(t_vec, I_vec, 'r-o', 'LineWidth', 1.5, 'MarkerSize', 4);
+    grid on;
+    ylabel('Current (A)', 'FontSize', 10);
+    title(sprintf('Time: %.4f s | Current: %.4f A', t, I), 'FontSize', 11);
+    xlim([0, max(t_vec(end), 1e-6)]); % 动态调整轴范围
+    
+    % --- 子图 2: 磁密波形 ---
+    subplot(2, 1, 2);
+    if isempty(B_hist)
+        % 兼容性处理: 如果尚未生成 B 数据 (第一步)
+        B_plot = 0; t_plot = 0;
+    else
+        B_plot = B_hist; t_plot = t_vec;
+    end
+    plot(t_plot, B_plot, 'b-d', 'LineWidth', 1.5, 'MarkerSize', 4);
+    grid on;
+    ylabel('|B| Magnitude (T)', 'FontSize', 10);
+    xlabel('Time (s)', 'FontSize', 10);
+    title(sprintf('Probe |B|: %.4f T', B_curr), 'FontSize', 11);
+    xlim([0, max(t_vec(end), 1e-6)]);
+    
+    drawnow limitrate; % 限制刷新率以保证计算速度
+end
