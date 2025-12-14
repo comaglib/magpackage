@@ -100,7 +100,7 @@ dir_map = -1.0 * CoilGeometryUtils.computeCircularDirection(mesh, NEW_TAG_PRIM, 
 fprintf('   -> Coil Config: R=%.4fm, Clockwise Direction Set.\n', radius);
 
 % 3.3 创建绕组对象
-% 定义物理属性：匝数=300, 直流电阻=100欧姆
+% 定义物理属性：匝数=3000, 直流电阻=10欧姆
 NP = 3000;
 RP = 10;
 winding = Winding('Primary', NEW_TAG_PRIM, NP, RP, area_S, [0, 0, 0]);
@@ -111,7 +111,7 @@ winding.setDirectionField(dir_map); % 赋予空间分布的方向场
 circuit = struct();
 circuit.R = RP;  % 外电路串联电阻
 circuit.L = 0;   % 外电路串联电感 (不包括线圈自感)
-% 定义电压源函数 (50Hz 正弦波, 幅值 76V)
+% 定义电压源函数 (50Hz 正弦波, 幅值 500V)
 Vamp = 500;
 circuit.V_source_func = @(t) Vamp * sin(2 * pi * 50 * t);
 
