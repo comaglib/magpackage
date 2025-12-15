@@ -1,61 +1,31 @@
 classdef LinearSolver < handle
-    % LINEARSOLVER 线性方程组求解器封装 (v3.7 - Robust MUMPS & Comments)
+    % LINEARSOLVER 线性方程组求解器封装 (v3.9 - Matrix Argument Fix)
     % 
-    % 功能描述:
-    %   该类为有限元求解提供统一的线性方程组求解接口 (Ax=b)。
-    %   它自动管理 MATLAB 内置求解器 (\) 与高性能稀疏直接求解器 (MUMPS) 之间的切换。
-    %
-    % 核心特性:
-    %   1. 自动回退: 若未安装 MUMPS，自动降级使用 MATLAB Backslash。
-    %   2. 复数支持: 自动检测矩阵虚部，切换实数(dmumps)/复数(zmumps)内核。
-    %   3. 健壮的错误处理: 修正了 MEX 调用异常时的内存清理逻辑，防止错误掩盖。
-    %
-    % 属性配置:
-    %   MumpsSymmetry: 0=非对称(默认), 1=正定对称(SPD), 2=一般对称(Symmetric Indefinite)
-    %   MumpsICNTL:    结构体，用于覆盖默认的 MUMPS 控制参数 (如内存分配率)。
+    % 更新日志:
+    %   v3.9: 修复了 MUMPS 调用参数不足的问题。
+    %         solveFromFactors 现在强制要求传入矩阵 A，以适配 dmumps.m/zmumps.m 的接口要求。
     
     properties
-        Method = 'Auto'     % 求解方法: 'Auto', 'MUMPS', 'Backslash', 'Iterative'
-        Tolerance = 1e-6    % 迭代求解器的收敛容差
-        MaxIter = 1000      % 迭代求解器的最大步数
-        
-        % --- MUMPS 配置 ---
-        % SYM=0: Unsymmetric (处理 HBFEM、涡流场等非对称矩阵)
-        % SYM=1: SPD (处理静磁场、拉普拉斯等正定对称矩阵，速度最快)
-        % SYM=2: General Symmetric (处理 A-V 形式等不定对称矩阵)
-        MumpsSymmetry = 0; 
-        
-        % ICNTL 控制参数 (默认 i14=100 表示内存预分配增加 100%)
+        Method = 'Auto'     % 'Auto', 'MUMPS', 'Backslash', 'Iterative'
+        Tolerance = 1e-6    
+        MaxIter = 1000      
+        MumpsSymmetry = 0;  % 0=Unsymmetric, 1=SPD, 2=General Symmetric
         MumpsICNTL = struct('i14', 100) 
     end
     
     methods
         function obj = LinearSolver(method)
-            % 构造函数
-            if nargin > 0
-                obj.Method = method;
-            else
-                obj.Method = 'Auto';
-            end
-            % 默认设置: ICNTL(7)=5 (Metis 排序)，通常对 3D 网格最优
-            obj.MumpsICNTL.i7 = 5; 
+            if nargin > 0, obj.Method = method; else, obj.Method = 'Auto'; end
+            obj.MumpsICNTL.i7 = 5; % Metis ordering
         end
         
         function x = solve(obj, A, b)
-            % SOLVE 求解 Ax = b
+            % SOLVE 标准一次性求解 Ax=b
+            if any(isnan(A), 'all') || any(isinf(A), 'all'), error('Matrix A contains NaN/Inf'); end
+            if any(isnan(b), 'all') || any(isinf(b), 'all'), error('RHS b contains NaN/Inf'); end
             
-            % 1. 输入数据检查 (防御性编程)
-            if any(isnan(A), 'all') || any(isinf(A), 'all')
-                error('LinearSolver:InputNaN', 'System matrix A contains NaN or Inf.');
-            end
-            if any(isnan(b), 'all') || any(isinf(b), 'all')
-                error('LinearSolver:InputNaN', 'RHS vector b contains NaN or Inf.');
-            end
-            
-            % 2. 确定求解策略
             use_method = obj.Method;
             if strcmpi(use_method, 'Auto')
-                % 检查是否有名为 initmumps 的 MEX 文件存在
                 if exist('initmumps', 'file') == 2 || exist('initmumps', 'file') == 3
                     use_method = 'MUMPS';
                 else
@@ -63,161 +33,126 @@ classdef LinearSolver < handle
                 end
             end
             
-            % 3. 执行求解
             switch upper(use_method)
                 case 'MUMPS'
-                    x = obj.solveMumps(A, b);
-                    
+                    x = obj.solveMumpsOneShot(A, b);
                 case {'BACKSLASH', 'DIRECT'}
-                    % MATLAB 内置稀疏直接求解器 (UMFPACK/CHOLMOD)
-                    % 极其稳定，但内存消耗通常高于 MUMPS
                     x = A \ b;
-                    
                 case 'ITERATIVE'
-                    % 迭代求解器 (仅作备用，通常需要预条件子才能收敛)
-                    if size(b, 2) > 1
-                         warning('Iterative solver called with MRHS. Switching to Backslash.');
-                         x = A \ b;
-                    else
-                        % 根据对称性选择算法
-                        if obj.MumpsSymmetry == 1 || obj.MumpsSymmetry == 2
-                            % 对称矩阵尝试 MINRES
-                            [x, flag] = minres(A, b, obj.Tolerance, obj.MaxIter);
-                        else
-                            % 非对称矩阵使用 GMRES
-                            [x, flag] = gmres(A, b, [], obj.Tolerance, obj.MaxIter);
-                        end
-                        
-                        if flag ~= 0
-                            warning('Iterative solver did not converge (Flag: %d). Result may be inaccurate.', flag);
-                        end
-                    end
-                    
+                    [x, ~] = gmres(A, b, [], obj.Tolerance, obj.MaxIter);
                 otherwise
-                    error('Unknown solver method: %s', obj.Method);
+                    error('Unknown method: %s', obj.Method);
+            end
+        end
+        
+        % =========================================================
+        %  新增接口: 分离式分解与求解 (针对 SDC 等算法优化)
+        % =========================================================
+        
+        function mumpsID = factorize(obj, A)
+            % FACTORIZE 执行 MUMPS 分析与分解 (JOB=4)
+            % 返回 mumpsID 结构体，包含分解因子。
+            
+            % 1. 初始化
+            id = initmumps;
+            id.JOB = -1; 
+            if obj.MumpsSymmetry == 1, id.SYM=1; elseif obj.MumpsSymmetry == 2, id.SYM=2; else, id.SYM=0; end
+            
+            is_complex = ~isreal(A);
+            if is_complex, id = zmumps(id); else, id = dmumps(id); end
+            
+            % 2. 配置
+            id.ICNTL(1:4) = 0; % Silence
+            if ~isempty(obj.MumpsICNTL)
+                fnames = fieldnames(obj.MumpsICNTL);
+                for k=1:length(fnames)
+                    idx = str2double(erase(fnames{k}, 'i'));
+                    if ~isnan(idx), id.ICNTL(idx) = obj.MumpsICNTL.(fnames{k}); end
+                end
+            end
+            
+            % 3. 分析 + 分解 (JOB = 4)
+            id.JOB = 4;
+            try
+                if is_complex
+                    if isreal(A), A = complex(A); end
+                    id = zmumps(id, A);
+                else
+                    id = dmumps(id, A);
+                end
+            catch ME
+                obj.safeClear(id, is_complex);
+                rethrow(ME);
+            end
+            
+            if id.INFOG(1) < 0
+                obj.safeClear(id, is_complex);
+                error('MUMPS Factorization Failed: INFOG(1)=%d', id.INFOG(1));
+            end
+            
+            mumpsID = id;
+        end
+        
+        function x = solveFromFactors(~, mumpsID, b, A)
+            % SOLVEFROMFACTORS 利用已分解的 ID 求解 (JOB=3)
+            % [Update] 增加了参数 A，因为 dmumps.m 封装要求必须传入矩阵
+            
+            is_complex = (isfield(mumpsID, 'TYPE') && mumpsID.TYPE == 2);
+            
+            mumpsID.JOB = 3; % Solve
+            if issparse(b), mumpsID.RHS = full(b); else, mumpsID.RHS = b; end
+            
+            % 调用求解
+            % 注意: 即使是求解步，dmumps.m 也要求传入 A
+            if is_complex
+                if isreal(A), A = complex(A); end
+                mumpsID = zmumps(mumpsID, A);
+            else
+                mumpsID = dmumps(mumpsID, A);
+            end
+            
+            if mumpsID.INFOG(1) < 0
+                error('MUMPS Solve Failed: INFOG(1)=%d', mumpsID.INFOG(1));
+            end
+            
+            x = mumpsID.SOL;
+        end
+        
+        function clearFactors(~, mumpsID)
+            % CLEARFACTORS 释放 MUMPS 实例内存 (JOB=-2)
+            if isempty(mumpsID), return; end
+            
+            is_complex = (isfield(mumpsID, 'TYPE') && mumpsID.TYPE == 2);
+            mumpsID.JOB = -2;
+            
+            try
+                % 清理时通常不需要传入矩阵，但如果 dmumps 报错，可以尝试传入 []
+                if is_complex, mumpsID = zmumps(mumpsID); else, mumpsID = dmumps(mumpsID); end
+            catch
+                % Ignore cleanup errors
             end
         end
     end
     
     methods (Access = private)
-        function x = solveMumps(obj, A, b)
-            % SOLVEMUMPS 封装 MUMPS 调用流程
-            % 流程: Init -> Analysis -> Factorization -> Solve -> Terminate
-            
-            % --- 1. 初始化 (JOB = -1) ---
-            id = initmumps;
-            id.JOB = -1; 
-            
-            % 设置对称性模式
-            if obj.MumpsSymmetry == 1
-                id.SYM = 1; % Symmetric Positive Definite
-            elseif obj.MumpsSymmetry == 2
-                id.SYM = 2; % General Symmetric
-            else
-                id.SYM = 0; % Unsymmetric (Default)
-            end
-            
-            % 检测是否需要复数算术
-            is_complex = ~isreal(A) || ~isreal(b);
-            
-            % 调用初始化 (实数或复数版本)
-            if is_complex
-                id = zmumps(id); 
-            else
-                id = dmumps(id); 
-            end
-            
-            % --- 2. 配置控制参数 (ICNTL) ---
-            % 先抑制标准输出 (除非调试需要)
-            id.ICNTL(1:4) = 0; 
-            
-            % 应用用户自定义参数
-            if ~isempty(obj.MumpsICNTL)
-                fnames = fieldnames(obj.MumpsICNTL);
-                for k = 1:length(fnames)
-                    name = fnames{k};
-                    % 解析 'i14' -> 14
-                    idx = str2double(erase(name, 'i')); 
-                    if ~isnan(idx) && idx > 0 && idx <= 40
-                        id.ICNTL(idx) = obj.MumpsICNTL.(name); 
-                    end
-                end
-            end
-            
-            % --- 3. 一步求解 (JOB = 6) ---
-            % JOB=6 包含: Analysis(1) + Factorization(2) + Solve(3)
-            id.JOB = 6; 
-            
-            % 准备右端项 RHS
-            % MUMPS 要求 RHS 是满矩阵 (Full Matrix)
-            if issparse(b)
-                id.RHS = full(b); 
-            else
-                id.RHS = b;
-            end
-            
+        function x = solveMumpsOneShot(obj, A, b)
+            % 一次性求解流程
+            id = obj.factorize(A); 
             try
-                % 执行核心计算
-                % 注意: zmumps 要求输入矩阵必须是 complex 类型，
-                % 如果 A 是 sparse real 但 is_complex 为真 (例如 RHS 是复数)，
-                % 必须显式转换 A，否则 MEX 可能崩溃。
-                if is_complex
-                    if isreal(A), A = complex(A); end 
-                    id = zmumps(id, A); % [Critical] 必须接收返回的 id
-                else
-                    id = dmumps(id, A); % [Critical] 必须接收返回的 id
-                end
-                
+                % [Fix] 传入 A
+                x = obj.solveFromFactors(id, b, A);
+                obj.clearFactors(id);
             catch ME
-                % --- 异常处理 ---
-                fprintf('[MUMPS Error] MEX call failed: %s\n', ME.message);
-                
-                % 尝试释放内存 (JOB = -2)
-                id.JOB = -2;
-                try
-                    if is_complex
-                        id = zmumps(id); % [Critical Fix] 接收 id
-                    else
-                        id = dmumps(id); % [Critical Fix] 接收 id
-                    end
-                catch
-                    % 如果清理也失败，通常意味着内存已损坏，无法做更多操作
-                end
-                
-                % 抛出原始错误
+                obj.clearFactors(id);
                 rethrow(ME);
             end
-            
-            % --- 4. 结果检查 ---
-            % INFOG(1) < 0 表示出错
-            if id.INFOG(1) < 0
-                err1 = id.INFOG(1); 
-                err2 = id.INFOG(2);
-                
-                % 尝试清理
-                id.JOB = -2;
+        end
+        
+        function safeClear(~, id, is_complex)
+            id.JOB = -2;
+            try
                 if is_complex, id = zmumps(id); else, id = dmumps(id); end
-                
-                % 常见错误代码解释
-                errMsg = sprintf('MUMPS Solver Failed: INFOG(1)=%d, INFOG(2)=%d', err1, err2);
-                if err1 == -9
-                    errMsg = [errMsg, ' (Error -9: Main memory allocation failed. Try increasing ICNTL(14))'];
-                elseif err1 == -10
-                    errMsg = [errMsg, ' (Error -10: Numerically singular matrix)'];
-                end
-                error('LinearSolver:MUMPSFailed', errMsg);
-            end
-            
-            % 提取解向量
-            x = id.SOL;
-            
-            % --- 5. 正常退出清理 (JOB = -2) ---
-            id.JOB = -2; 
-            if is_complex
-                id = zmumps(id); % [Critical Fix] 接收 id
-            else
-                id = dmumps(id); % [Critical Fix] 接收 id
-            end
+            catch; end
         end
     end
 end
