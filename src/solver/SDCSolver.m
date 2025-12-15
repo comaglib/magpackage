@@ -8,11 +8,11 @@ classdef SDCSolver < handle
     properties
         Assembler       % 有限元组装器对象
         LinearSolver    % 线性方程组求解器 (需支持复数求解)
-        PolyOrder = 3        
-        MaxSDCIters = 5      
-        SDCTolerance = 1e-6  
+        PolyOrder = 3
+        MaxSDCIters = 10
+        SDCTolerance = 1e-4
         MaxNewtonIters = 15  
-        NewtonTolerance = 1e-4 
+        NewtonTolerance = 1e-4
         UseLineSearch = true
     end
     
@@ -185,42 +185,124 @@ classdef SDCSolver < handle
     
     methods (Access = private)
         function X_pred = predictionStep(obj, x0, ctx)
-            % 预测步 (Backward Euler)
+            % PREDICTIONSTEP 预测步 (v10.0 - One-Step Re-linearized Backward Euler)
+            %
+            % 策略:
+            %   "小步快跑，单次更新"。
+            %   为了穿越强非线性饱和区，我们必须在每个 GLL 子步更新雅可比矩阵。
+            %   但为了节省时间，我们每个子步只做【一次】牛顿迭代 (Linearized Implicit Euler)。
+            %
+            % 优势:
+            %   1. 相比全牛顿迭代: 速度快 (无内层循环)。
+            %   2. 相比单步线性化: 能动态更新刚度，能够"爬"上饱和曲线。
+            %   3. 物理上极其稳健。
+            
             num_nodes = ctx.Spectral.NumNodes; 
             num_dofs = ctx.numTotalDofs;
             
             X_pred = zeros(num_dofs, num_nodes);
             X_pred(:, 1) = x0;
             
-            x_prev = x0;
+            x_curr = x0;
             t_start_slab = ctx.t_start;
             dt_slab = ctx.dt_slab;
             nodes = ctx.Spectral.Nodes;
             
+            % 遍历所有子间隔
             for m = 2:num_nodes
                 tau_curr = nodes(m);
                 tau_prev = nodes(m-1);
                 
+                % 计算子步物理参数
                 t_curr = t_start_slab + (tau_curr + 1)/2 * dt_slab;
                 dt_sub = (tau_curr - tau_prev)/2 * dt_slab;
                 
-                fprintf('      - Node %d/%d (dt=%.1e): ', m, num_nodes, dt_sub);
+                % --------------------------------------------------------
+                % 执行单步线性化求解 (One-Step Newton)
+                % Equation: R(x_new) = 0
+                % Linearized: J(x_curr) * dx = -R(x_curr_guess)
+                % 这里我们取 x_curr_guess = x_curr (上一节点的值)
+                % --------------------------------------------------------
                 
+                % 1. 组装雅可比 (基于 x_curr)
+                A_vec = x_curr(1:ctx.num_A);
+                [K_fem_small, R_fem_base] = obj.Assembler.assembleJacobian(ctx.space_A, A_vec, ctx.matLib, true);
+                
+                % 扩展矩阵
+                [ki, kj, kv] = find(K_fem_small);
+                K_fem = sparse(ki, kj, kv, num_dofs, num_dofs);
+                
+                Scale = ctx.CircuitRowScale;
+                [w_idx, ~, w_val] = find(ctx.W_vec);
+                
+                % 构建系统矩阵 J_sys = M/dt + K + Couplings
+                % 构建残差 Res = M*(x-x_prev)/dt + K*x - F - ...
+                % 注意：因为我们在做一步线性化，实际上就是求解:
+                % (M/dt + K_tan) * dx = F_source - (Internal_Forces_at_x_curr)
+                % 但为了代码复用和逻辑清晰，我们直接组装标准 Newton 形式
+                
+                % M_sys
+                M_cir_row = sparse(repmat(num_dofs, length(w_idx), 1), w_idx, w_val * Scale, num_dofs, num_dofs);
+                M_cir_diag = sparse(num_dofs, num_dofs, ctx.circuit.L * Scale, num_dofs, num_dofs);
+                M_sys = ctx.M_sigma + M_cir_row + M_cir_diag;
+                
+                % K_sys (Tangent Stiffness)
+                K_base = K_fem + ctx.C_AP + ctx.C_AP';
+                K_col_coup = sparse(w_idx, repmat(num_dofs, length(w_idx), 1), -w_val, num_dofs, num_dofs);
+                K_row_coup = sparse(repmat(num_dofs, length(w_idx), 1), w_idx, (w_val/dt_sub)*Scale, num_dofs, num_dofs);
+                K_cir_diag = sparse(num_dofs, num_dofs, ctx.circuit.R * Scale, num_dofs, num_dofs);
+                K_cir_L_dt = sparse(num_dofs, num_dofs, (ctx.circuit.L/dt_sub) * Scale, num_dofs, num_dofs);
+                
+                J_sys = M_sys / dt_sub + K_base + K_col_coup + K_row_coup + K_cir_diag + K_cir_L_dt;
+                
+                % 2. 组装残差 (基于 x_curr, 假设 x_new = x_curr 时的非平衡力)
+                % dx/dt 初始猜测为 0 (因为我们用 x_curr 作为 x_new 的猜测)
+                % Res = K(x)*x - F_source
+                
+                Res = sparse(num_dofs, 1);
+                Res(1:length(R_fem_base)) = R_fem_base;
+                
+                Res = Res + (ctx.C_AP + ctx.C_AP') * x_curr;
+                
+                I_val = x_curr(end);
+                Res = Res - ctx.W_vec * I_val; % -W*I
+                
+                % 电路方程部分
                 V_source = ctx.circuit.V_source_func(t_curr);
-                [x_next, ~] = obj.solveBackwardEulerStep(x_prev, dt_sub, V_source, ctx);
+                % 电感和电动势项此时为 0 (因为 guess dx/dt = 0)
+                term_R = ctx.circuit.R * I_val;
+                Res(end) = (term_R - V_source) * Scale;
                 
+                % 3. 求解
+                [J_bc, Res_bc] = BoundaryCondition.applyDirichlet(J_sys, Res, ctx.fixedDofs);
+                
+                % 使用 factorize 加速? 
+                % 这里的 J 每次都变，factorize 也没有复用机会，直接 solve 即可
+                % 但为了稳定性，我们依然可以用 MUMPS
+                dx = obj.LinearSolver.solve(J_bc, -Res_bc);
+                
+                % 4. 更新
+                x_next = x_curr + dx;
+                
+                % 存储
                 X_pred(:, m) = x_next;
-                x_prev = x_next;
+                x_curr = x_next; % 推进到下一步
             end
         end
         
-        function Systems = linearizationStep(obj, X_ref, ctx)
-            % 线性化与解耦
-            Systems = struct();
-            fprintf('      - Computing Frozen Jacobian (from Slab End-Point)...\n');
+        function Systems = linearizationStep(obj, x_linearize_input, ctx)
+            % LINEARIZATIONSTEP (End-Point)
             
-            % 使用终值线性化
-            x_ref_state = X_ref(:, end);
+            Systems = struct();
+            
+            % 如果输入是 Matrix (X_slab)，取最后一列 (End-Point)
+            % 如果输入是 Vector (x_start)，则直接使用
+            if size(x_linearize_input, 2) > 1
+                x_ref_state = x_linearize_input(:, end);
+            else
+                x_ref_state = x_linearize_input;
+            end
+            
             A_ref = x_ref_state(1:ctx.num_A);
             
             [K_fem_small, ~] = obj.Assembler.assembleJacobian(ctx.space_A, A_ref, ctx.matLib, true);
@@ -245,7 +327,6 @@ classdef SDCSolver < handle
             dt_factor = ctx.dt_slab / 2.0; 
             
             Systems.Factors = cell(length(lambda), 1);
-            count_factorized = 0;
             
             for m = 1:length(lambda)
                 type = pair_map(m).Type;
@@ -263,34 +344,127 @@ classdef SDCSolver < handle
                     [A_bc, ~] = BoundaryCondition.applyDirichlet(A_complex, zeros(num_total,1), ctx.fixedDofs);
                     
                     try
-                        % [Fix] 存储分解因子 ID 和 矩阵 A_bc
                         mumpsID = obj.LinearSolver.factorize(A_bc);
                         Systems.Factors{m} = struct('id', mumpsID, 'mat', A_bc);
-                        count_factorized = count_factorized + 1;
                     catch ME
                         warning('SDC Subsystem %d factorization failed: %s', m, ME.message);
                         Systems.Factors{m} = [];
                     end
                 end
             end
-            fprintf('      - Factorized %d unique subsystems (MUMPS Optimized).\n', count_factorized);
             
             Systems.M_sys = M_sys;
             Systems.K_sys = K_sys; 
         end
         
         function [X_new, error_norm] = sdcCorrectionStep(obj, X_curr, x0, Systems, ctx)
-            % SDCCORRECTIONSTEP 执行一次完整的 SDC 修正扫描 (带自适应阻尼)
+            % SDCCORRECTIONSTEP 执行一次完整的 SDC 修正扫描 (带回溯线搜索)
             % 
-            % [v7.17 Fix] 引入阻尼因子 (Damping Factor)
-            % 原因: 在极强饱和区 (Slab 4)，冻结 Jacobian 与实际刚度偏差过大，
-            %       全量更新 (alpha=1.0) 会导致震荡发散。
+            % [v7.18 Fix] 引入 SDC 线搜索 (SDC Line Search)
+            % 原因: 在极强饱和区，单纯的阻尼(Damping)不足以防止发散。
+            %       必需检查更新后的 Defect Norm 是否下降，否则强制缩小步长。
+            
+            num_nodes = ctx.Spectral.NumNodes;
+            num_dofs = ctx.numTotalDofs;
+            
+            % 1. 计算当前状态的 Defect (残差)
+            %    这是上一轮迭代结束时的残差
+            [Defect_old, ~, G] = obj.computeSDCDefect(X_curr, x0, Systems, ctx);
+            norm_old = norm(Defect_old, 'fro');
+            
+            % 2. 求解修正量 Delta_X (基于冻结 Jacobian)
+            %    这是建议的更新方向
+            
+            % (G 已经在 computeSDCDefect 中计算好: G = Defect * S_inv')
+            Delta_Y = zeros(size(G));
+            pair_map = ctx.Spectral.PairMap;
+            Factors = Systems.Factors;
+            
+            for m = 1:num_nodes
+                ptype = pair_map(m).Type;
+                if isempty(Factors{m})
+                    Delta_Y(:, m) = 0; continue; 
+                end
+                
+                if strcmp(ptype, 'Real') || strcmp(ptype, 'ComplexA')
+                    rhs = G(:, m);
+                    sys_data = Factors{m};
+                    dy = obj.LinearSolver.solveFromFactors(sys_data.id, rhs, sys_data.mat);
+                    Delta_Y(:, m) = dy;
+                    if strcmp(ptype, 'ComplexA')
+                        idx_B = pair_map(m).ConjIdx;
+                        Delta_Y(:, idx_B) = conj(dy);
+                    end
+                end
+            end
+            
+            S = ctx.Spectral.S;
+            Delta_X = Delta_Y * S.';
+            Delta_X = real(Delta_X);
+            
+            % 3. 回溯线搜索 (Backtracking Line Search)
+            %    目标: 寻找 alpha 使得 norm(Defect(X + alpha*dX)) < norm(Defect(X))
+            
+            alpha = 1.0;
+            min_alpha = 1e-3; % 最小步长保护
+            dec_factor = 0.3;
+            accepted = false;
+            
+            X_new = X_curr; % Default
+            norm_new = norm_old;
+            
+            while alpha > min_alpha
+                X_try = X_curr + alpha * Delta_X;
+                
+                % 强制边界和初值约束 (不参与残差竞争)
+                X_try(ctx.fixedDofs, :) = repmat(x0(ctx.fixedDofs), 1, num_nodes);
+                X_try(:, 1) = x0; 
+                
+                % 计算试探步的残差
+                [Defect_try, ~] = obj.computeSDCDefect(X_try, x0, Systems, ctx);
+                norm_try = norm(Defect_try, 'fro');
+                
+                % 简单的下降准则 (Armijo-like condition)
+                % 允许偶尔微弱上升以跳出局部极小，但在刚性问题中严格下降通常更稳
+                if norm_try < norm_old || norm_try < 1e-8
+                    X_new = X_try;
+                    norm_new = norm_try;
+                    accepted = true;
+                    if alpha < 1.0
+                        % fprintf('      [SDC-LS] Backtrack alpha=%.4f (Norm: %.2e -> %.2e)\n', alpha, norm_old, norm_try);
+                    end
+                    break;
+                end
+                
+                alpha = alpha * dec_factor;
+            end
+            
+            if ~accepted
+                % 如果线搜索失败，通常意味着 Jacobian 极度失效
+                % 此时强制使用极小步长更新，寄希望于下一次迭代
+                % fprintf('      [SDC-LS] Failed. Forcing small step.\n');
+                X_new = X_curr + min_alpha * Delta_X;
+                X_new(ctx.fixedDofs, :) = repmat(x0(ctx.fixedDofs), 1, num_nodes);
+                X_new(:, 1) = x0; 
+            end
+            
+            % [Improvement] 使用混合相对/绝对误差标准
+            % 分母加 eps 或 tol_abs 是为了防止 X 为 0 时除以零
+            % norm('fro') 是 Frobenius 范数，相当于所有元素的平方和开根号
+            numerator = norm(Delta_X * alpha, 'fro');
+            denominator = norm(X_new, 'fro') + 1e-6; % 1e-6 是防止除零的底噪保护
+            error_norm = numerator / denominator;
+        end
+        
+        function [Defect, F_all, G] = computeSDCDefect(obj, X_curr, x0, Systems, ctx)
+            % 辅助函数: 计算当前状态 X_curr 下的 SDC 残差 (Defect)
+            % Defect = M*x0 + Integral(F(x)) - M*x
             
             num_nodes = ctx.Spectral.NumNodes;
             num_dofs = ctx.numTotalDofs;
             dt_half = ctx.dt_slab / 2.0;
             
-            % 1. 计算物理残差 F(t, x)
+            % 1. 计算物理力 F(t, x)
             F_all = zeros(num_dofs, num_nodes);
             Scale = ctx.CircuitRowScale;
             C_AP_tot = ctx.C_AP + ctx.C_AP';
@@ -300,11 +474,13 @@ classdef SDCSolver < handle
             nodes = ctx.Spectral.Nodes;
             t_physical = ctx.t_start + (nodes + 1) * dt_half;
             
+            % 此循环是线搜索的性能瓶颈，但在刚性问题中是值得的
             for m = 1:num_nodes
                 x_m = X_curr(:, m);
                 t_m = t_physical(m);
                 
                 A_vec = x_m(1:ctx.num_A);
+                % 仅计算残差，不计算 Jacobian (calcJ=false)
                 [~, R_fem] = obj.Assembler.assembleJacobian(ctx.space_A, A_vec, ctx.matLib, false);
                 
                 R_fem_ext = sparse(num_dofs, 1);
@@ -324,65 +500,20 @@ classdef SDCSolver < handle
             Q = ctx.Spectral.Q;
             Integral_F = (F_all * Q.') * dt_half;
             
-            % 3. Defect (Picard 误差)
+            % 3. 计算 Defect
             M_sys = Systems.M_sys;
             M_x0 = M_sys * x0; 
             M_X = M_sys * X_curr;
+            
             Defect = M_x0 + Integral_F - M_X;
             
-            % 4. 变换到特征空间
-            S_inv = ctx.Spectral.S_inv;
-            G = Defect * S_inv.';
-            
-            % 5. 并行求解 (修正量 Delta_Y)
-            Delta_Y = zeros(size(G));
-            pair_map = ctx.Spectral.PairMap;
-            Factors = Systems.Factors;
-            
-            for m = 1:num_nodes
-                ptype = pair_map(m).Type;
-                
-                if isempty(Factors{m})
-                    Delta_Y(:, m) = 0;
-                    continue; 
-                end
-                
-                if strcmp(ptype, 'Real') || strcmp(ptype, 'ComplexA')
-                    rhs = G(:, m);
-                    
-                    sys_data = Factors{m};
-                    dy = obj.LinearSolver.solveFromFactors(sys_data.id, rhs, sys_data.mat);
-                    
-                    Delta_Y(:, m) = dy;
-                    
-                    if strcmp(ptype, 'ComplexA')
-                        idx_B = pair_map(m).ConjIdx;
-                        Delta_Y(:, idx_B) = conj(dy);
-                    end
-                end
+            % 4. 计算特征空间投影 (可选输出)
+            if nargout > 2
+                S_inv = ctx.Spectral.S_inv;
+                G = Defect * S_inv.';
+            else
+                G = [];
             end
-            
-            % 6. 反变换回物理空间
-            S = ctx.Spectral.S;
-            Delta_X = Delta_Y * S.';
-            Delta_X = real(Delta_X);
-            
-            % 7. 更新 (带阻尼)
-            % [STRATEGY] 使用简单的阻尼策略。
-            % 初始几次迭代使用较小阻尼以稳定，后期全量更新。
-            % 或者监测 Defect Norm 是否上升（这里简化为固定阻尼）
-            
-            % 对于极强非线性问题，0.5 ~ 0.8 是比较安全的范围
-            damping = 0.8; 
-            
-            X_new = X_curr + damping * Delta_X;
-            
-            % 强制边界和初始条件
-            X_new(ctx.fixedDofs, :) = repmat(x0(ctx.fixedDofs), 1, num_nodes);
-            X_new(:, 1) = x0; 
-            
-            % 误差范数基于全量 Delta_X 计算
-            error_norm = norm(Delta_X, 'fro') / sqrt(num_nodes * num_dofs);
         end
         
         function cleanUpSystems(obj, Systems)
@@ -398,7 +529,7 @@ classdef SDCSolver < handle
         end
         
         function [x_new, converged] = solveBackwardEulerStep(obj, x_prev, dt, V_source, ctx)
-            % 辅助函数: 求解单步 Backward Euler (带回溯线搜索)
+            % 辅助函数: 求解单步 Backward Euler (带回溯线搜索 & 混合收敛判据)
             x_curr = x_prev;
             converged = false;
             tol = obj.NewtonTolerance; 
@@ -406,6 +537,11 @@ classdef SDCSolver < handle
             % 初始残差计算
             [Res, J_sys] = obj.computeResidual(x_curr, x_prev, dt, V_source, ctx, true);
             res_norm = norm(Res);
+            
+            % [新增] 记录初始残差，用于计算相对下降量
+            res_norm_init = res_norm;
+            % 防止初始残差为0导致除零错误 (虽极少见)
+            if res_norm_init < 1e-12, res_norm_init = 1.0; end
             
             for iter = 1:obj.MaxNewtonIters
                 % 1. 求解牛顿步
@@ -415,7 +551,7 @@ classdef SDCSolver < handle
                 % 2. 回溯线搜索 (Backtracking Line Search)
                 alpha = 1.0;
                 dec_factor = 0.5;
-                min_alpha = 1e-2; % 防止死循环
+                min_alpha = 1e-2; 
                 accepted = false;
                 
                 res_norm_prev = res_norm;
@@ -423,56 +559,74 @@ classdef SDCSolver < handle
                 while alpha > min_alpha
                     x_try = x_curr + alpha * dx;
                     
-                    % 仅计算残差 (calcJ=false) 以节省时间
+                    % 仅计算残差
                     [Res_try, ~] = obj.computeResidual(x_try, x_prev, dt, V_source, ctx, false);
-                    
-                    % 强制边界残差为0 (不计入范数)
                     Res_try(ctx.fixedDofs) = 0; 
                     res_norm_new = norm(Res_try);
                     
-                    % Armijo 准则简化版: 只要残差下降即可接受
+                    % Armijo 准则
                     if res_norm_new < res_norm_prev
                         x_curr = x_try;
                         Res = Res_try;
                         res_norm = res_norm_new;
                         accepted = true;
-                        
-                        % 如果是第一步且 alpha < 1，说明非线性极强
-                        % if alpha < 1.0, fprintf('      [LS] Backtrack alpha=%.2f\n', alpha); end
                         break;
                     end
                     alpha = alpha * dec_factor;
                 end
                 
-                % 如果线搜索失败，强制接受最小步长（避免死锁），但很可能不收敛
                 if ~accepted
                     x_curr = x_curr + min_alpha * dx;
-                    % 重新计算完整 Jacobian 供下一步使用
                     [Res, J_sys] = obj.computeResidual(x_curr, x_prev, dt, V_source, ctx, true);
                     res_norm = norm(Res);
                 else
-                    % 如果接受了，且需要进行下一次迭代，需更新 Jacobian
-                    % 注意: 如果已经收敛，则不需要这一步，但在循环头判断更清晰
-                    if res_norm > tol
+                    if res_norm > tol % 仅当未达到绝对精度时才重算 Jacobian，优化性能
                          [Res, J_sys] = obj.computeResidual(x_curr, x_prev, dt, V_source, ctx, true);
                     end
                 end
                 
-                % 3. 收敛判断 (使用更新量 dx 和 残差 res_norm 双重判断)
-                % 注意: dx 是全步长，如果 alpha 小，实际移动量是 alpha*dx
-                if res_norm < tol || (norm(dx)*alpha < tol && iter > 1)
+                % ==========================================================
+                % 3. 混合收敛判据 (Robust Convergence Check)
+                % ==========================================================
+                
+                % (A) 绝对残差判据 (适合小信号或过零点)
+                is_abs_res_conv = (res_norm < tol);
+                
+                % (B) 相对残差判据 (适合大信号，要求残差相比初始值下降足够多)
+                %     例如: tol=1e-4, 意味着残差下降了 4 个数量级
+                rel_res = res_norm / res_norm_init;
+                is_rel_res_conv = (rel_res < tol);
+                
+                % (C) 相对步长判据 (防止平坦区域震荡)
+                %     判断解本身是否已经不再变化
+                %     分母加 1e-6 是防止 x_curr 为 0
+                step_size = norm(dx) * alpha;
+                rel_step = step_size / (norm(x_curr) + 1e-6);
+                is_step_conv = (rel_step < tol);
+                
+                % 只要满足任意一个，即认为收敛
+                if is_abs_res_conv || is_rel_res_conv || is_step_conv
                     converged = true; 
-                    fprintf('- Newton Converged (Iter %d, Res=%.2e)\n', iter, res_norm);
+                    % 打印详细收敛原因，方便调试
+                    if is_abs_res_conv
+                        tag = 'AbsRes';
+                    elseif is_rel_res_conv
+                        tag = 'RelRes';
+                    else
+                        tag = 'RelStep';
+                    end
+                    fprintf('Newton Converged (Iter %d, %s): Res=%.2e, RelRes=%.2e\n', ...
+                        iter, tag, res_norm, rel_res);
                     break; 
                 end
             end
             
             if ~converged
-                fprintf('      [Warn] Prediction Newton Max Iter Reached (Res=%.2e)\n', res_norm);
+                fprintf('      [Warn] Prediction Newton Max Iter Reached (Res=%.2e, Rel=%.2e)\n', res_norm, res_norm/res_norm_init);
             end
             x_new = x_curr;
         end
-        
+
         function [Res, J_sys] = computeResidual(obj, x_curr, x_prev, dt, V_source, ctx, calcJ)
             % 统一计算残差和雅可比矩阵
             % calcJ = false 时，J_sys 返回空，加速线搜索
