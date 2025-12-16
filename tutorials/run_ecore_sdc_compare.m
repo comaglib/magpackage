@@ -114,13 +114,13 @@ fprintf('\n[Run 2] High-Order SDC Solver (Coarse Step)...\n');
 
 % SDC 策略: 
 % 使用粗步长 (2ms, 即 BDF1 的 5 倍)，通过高阶多项式 (P=4) 来弥补精度。
-dt_slab = 2e-3;          
+dt_slab = 5e-3;          
 timeSteps_sdc = repmat(dt_slab, round(timeSim/dt_slab), 1);
 
 solver_sdc = SDCSolver(assembler);
-solver_sdc.PolyOrder = 4;     % 多项式阶数 P=4 (5个节点)
-solver_sdc.MaxSDCIters = 20;  % SDC 最大修正次数
-solver_sdc.SDCTolerance = 1e-4; % SDC 收敛容差 (相对/绝对混合判据)
+solver_sdc.PolyOrder = 4;       % 多项式阶数 P=4 (5个节点)
+solver_sdc.MaxSDCIters = 20;    % SDC 最大修正次数
+solver_sdc.SDCTolerance = 1e-3; % SDC 收敛容差 (相对/绝对混合判据)
 
 tic;
 [~, info_sdc] = solver_sdc.solve(space_A, space_P, matLib, sigmaMap, ...
