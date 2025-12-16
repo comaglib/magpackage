@@ -119,7 +119,7 @@ circuit.V_source_func = @(t) Vamp * sin(2 * pi * 50 * t);
 fprintf('[Step 4] Configuring Solver...\n');
 
 assembler = Assembler(mesh, dofHandler);
-solver = TransientCoupledSolver(assembler);
+solver = TransientBDF2Solver(assembler);
 
 % 4.1 迭代控制参数
 solver.Tolerance = 1e-2;    % 绝对收敛容差

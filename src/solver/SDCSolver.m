@@ -2,25 +2,26 @@ classdef SDCSolver < handle
     % SDCSOLVER 基于非线性序列扫描的 SDC 求解器 (v12.0 - Nonlinear SISDC + Full Logging)
     % 
     % 核心机制: Semi-Implicit SDC (SISDC)
-    %   1. 不做全局线性化预测，而是沿着 GLL 节点逐个求解非线性方程。
-    %   2. 每个子步本质上是一个 "带高阶源项修正的 Backward Euler"。
-    %   3. 这种方法对变压器饱和等刚性问题极其稳健。
+    %   1. 不做全局线性化预测，而是沿着 GLL 节点逐个求解非线性方程 (Sequential Sweeping)。
+    %   2. 每个子步本质上是一个 "带高阶源项修正的 Backward Euler" (L-stable)。
+    %   3. 这种方法对变压器饱和等刚性问题极其稳健 (Stiff & Nonlinear)。
     
     properties
-        Assembler       % 有限元组装器
-        LinearSolver    % 线性求解器
+        Assembler       % Finite Element Assembler (有限元组装器，负责空间离散)
+        LinearSolver    % Linear Solver Wrapper (线性求解器，如 MUMPS)
         
-        PolyOrder = 3        % 多项式阶数 (建议 3 或 4)
-        MaxSDCIters = 5      % SDC 扫描次数 (SISDC 收敛很快，通常 5 次足够)
-        SDCTolerance = 1e-4  % SDC 收敛容差
+        PolyOrder = 3        % 多项式阶数 P (建议 3 或 4)。决定了每个 Time Slab 内有 P+1 个 GLL 节点。
+        MaxSDCIters = 5      % SDC 扫描次数 K (SISDC 收敛很快，通常 5 次足够将误差降至底噪)。
+        SDCTolerance = 1e-4  % SDC 收敛容差 (用于提前退出扫描循环)。
     end
     
     methods
         function obj = SDCSolver(assembler)
+            % 构造函数：初始化组装器和线性求解器配置
             obj.Assembler = assembler;
             obj.LinearSolver = LinearSolver('Auto');
-            obj.LinearSolver.MumpsSymmetry = 0; 
-            obj.LinearSolver.MumpsICNTL.i14 = 300; 
+            obj.LinearSolver.MumpsSymmetry = 0; % 非对称矩阵 (因为包含电路耦合项)
+            obj.LinearSolver.MumpsICNTL.i14 = 300; % 增加工作内存百分比，防止溢出
         end
         
         function [solutionResults, info] = solve(obj, space_A, space_P, ...
@@ -31,74 +32,107 @@ classdef SDCSolver < handle
                                                  init_State, ...
                                                  monitorHandle, ...
                                                  probePoint)
+            % SOLVE 主求解函数
+            % 输入:
+            %   space_A/P: 有限元空间对象
+            %   matLib/sigmaMap: 材料属性库和电导率映射
+            %   circuitProps/windingObj: 电路参数和绕组几何信息
+            %   timeSteps: 时间步长数组 (每个元素代表一个 Time Slab 的长度)
+            %   fixedDofs: 边界条件
+            %   init_State: 初始状态向量
+            %   monitorHandle: 用于实时绘图的回调函数
+            %   probePoint: 磁密探测点坐标
             
             fprintf('==================================================\n');
             fprintf('   SDC Solver (Nonlinear SISDC, P=%d)\n', obj.PolyOrder);
             fprintf('==================================================\n');
             
-            % --- 1. 初始化与预计算 ---
+            % --- 1. 初始化与预计算 (Initialization & Pre-computation) ---
+            % 分配自由度 (DoFs)
             dofHandler = obj.Assembler.DofHandler;
             if ~dofHandler.DofMaps.isKey(space_A.toString()), dofHandler.distributeDofs(space_A); end
             if ~dofHandler.DofMaps.isKey(space_P.toString()), dofHandler.distributeDofs(space_P); end
             
+            % 构建上下文结构体 (Context)，用于在各函数间传递参数
             ctx.num_A = dofHandler.SpaceLocalSizes(space_A.toString());
-            ctx.numTotalDofs = dofHandler.NumGlobalDofs + 1; 
+            ctx.numTotalDofs = dofHandler.NumGlobalDofs + 1; % +1 是为了电路电流自由度 I
             ctx.space_A = space_A; ctx.space_P = space_P;
             ctx.matLib = matLib; ctx.circuit = circuitProps;
             
-            % 初始化探针
-            postProc = []; probeB_History = []; 
+            % 初始化后处理探针
+            postProc = []; 
             if ~isempty(probePoint)
                 postProc = PostProcessor(obj.Assembler);
-                probeB_History = zeros(length(timeSteps), 1);
             end
             
-            % SDC 谱积分矩阵 (GLL)
+            % [Data Collection] 全量数据容器 (High-Res Interpolated)
+            % 用于存储插值后的平滑波形数据
+            full_time_list = [];
+            full_current_list = [];
+            full_B_list = [];
+            
+            % 简略历史 (仅记录每个 Slab 的终点值)
+            probeB_History = zeros(length(timeSteps), 1);
+            currentHistory = zeros(length(timeSteps), 1);
+            
+            % --- 2. SDC 谱积分矩阵计算 (Spectral Integration Matrix) ---
             fprintf('   [Init] Computing GLL nodes and integration matrix...\n');
+            % 计算 Gauss-Lobatto-Legendre 节点和权重
             [gll_nodes, gll_weights] = SpectralTimeUtils.gll(obj.PolyOrder);
+            % 计算积分矩阵 Q (Q_ij = integral of Lagrange basis j from -1 to node i)
             Q_mat = SpectralTimeUtils.integration_matrix(gll_nodes);
             
             ctx.Spectral.Nodes = gll_nodes; 
             ctx.Spectral.Weights = gll_weights;
-            ctx.Spectral.Q = Q_mat; % 积分矩阵 [NumNodes x NumNodes]
+            ctx.Spectral.Q = Q_mat; 
             ctx.Spectral.NumNodes = length(gll_nodes); 
             
-            % 组装不变矩阵 (M, C, W)
+            % [Plotting] 预计算插值点 (用于稠密输出)
+            % 在每个 Time Slab 内部生成 20 个均匀分布点，用于绘制平滑曲线
+            NumPlotPoints = 20;
+            tau_plot = linspace(-1, 1, NumPlotPoints)'; % [-1, 1] 均匀分布
+            
+            % --- 3. 组装不变矩阵 (Invariant Matrices Assembly) ---
             fprintf('   [Init] Assembling invariant matrices...\n');
+            % 质量矩阵 M_sigma (加权电导率)
             M_sigma_local = obj.Assembler.assembleMassWeighted(space_A, sigmaMap);
             [mi, mj, mv] = find(M_sigma_local);
             ctx.M_sigma = sparse(mi, mj, mv, ctx.numTotalDofs, ctx.numTotalDofs);
             
+            % 耦合矩阵 C (如果有 Lagrange 乘子)
             C_AP_local = obj.Assembler.assembleCoupling(space_A, space_P, 1.0);
             [ci, cj, cv] = find(C_AP_local);
             ctx.C_AP = sparse(ci, cj, cv, ctx.numTotalDofs, ctx.numTotalDofs);
             
+            % 绕组耦合向量 W (FEM -> Circuit)
             W_fem = obj.Assembler.assembleWinding(space_A, windingObj);
             ctx.W_vec = sparse(ctx.numTotalDofs, 1);
             ctx.W_vec(1:length(W_fem)) = W_fem;
             
+            % 电路方程缩放因子 (Geo-balancing)
+            % 用于平衡场方程(1e-6量级)和电路方程(1e2量级)的数值差异，改善条件数
             dt_init = timeSteps(1); 
             ctx.CircuitRowScale = obj.calculateCircuitScale(ctx, dt_init);
             fprintf('   [Init] Circuit Scale Factor = %.2e\n', ctx.CircuitRowScale);
             
-            % 边界条件索引
+            % 处理 Dirichlet 边界条件
             if islogical(fixedDofs_A), idx_A = find(fixedDofs_A); else, idx_A = fixedDofs_A(:); end
             if islogical(fixedDofs_P), idx_P = find(fixedDofs_P); else, idx_P = fixedDofs_P(:); end
             ctx.fixedDofs = [idx_A; idx_P];
             ctx.fixedDofs = ctx.fixedDofs(ctx.fixedDofs < ctx.numTotalDofs);
             
-            % 初始状态
+            % 设置初始状态向量 x_0
             x_start = zeros(ctx.numTotalDofs, 1);
             if nargin >= 11 && ~isempty(init_State)
                 n = min(length(init_State), ctx.numTotalDofs);
                 x_start(1:n) = init_State(1:n);
             end
             
-            currentHistory = zeros(length(timeSteps), 1);
             globalTime = 0;
             
             % ==================================================
             % 主时间循环 (Time Slab Loop)
+            % 每个循环处理一个大的时间片 [t_n, t_n + dt_slab]
             % ==================================================
             for slab_idx = 1:length(timeSteps)
                 dt_slab = timeSteps(slab_idx);
@@ -111,22 +145,25 @@ classdef SDCSolver < handle
                 ctx.dt_slab = dt_slab;
                 ctx.t_start = t_start;
                 
-                % 1. Initialization (直接复制初值)
+                % 1. Initialization (初值填充)
+                % 将整个 Slab 内所有节点的初值设为上一个 Slab 的终值 (Constant Prediction)
                 X_slab = repmat(x_start, 1, ctx.Spectral.NumNodes);
                 
                 % 2. SDC Sweep (非线性序列扫描)
+                % 核心迭代过程：反复"扫描"时间片，提升精度
                 for sdc_iter = 1:obj.MaxSDCIters
-                    fprintf('   [SDC Sweep %d] Start...\n', sdc_iter);
-                    
-                    % 保存上一轮的解 (用于计算高阶积分项)
                     X_old = X_slab;
-                    
-                    % 执行一次完整的序列扫描
+                    % 调用核心扫描函数
                     [X_slab, max_diff_norm, residual_norm] = obj.performSISDCSweep(X_old, x_start, ctx);
                     
-                    fprintf('   [SDC Sweep %d] Result: UpdateNorm=%.2e, Residual=%.2e', ...
-                        sdc_iter, max_diff_norm, residual_norm);
+                    % 打印收敛信息
+                    if max_diff_norm < 1e-4
+                        fprintf('   Iter %d: Update=%.2e, Res=%.2e', sdc_iter, max_diff_norm, residual_norm);
+                    else
+                        fprintf('   Iter %d: Update=%.4f, Res=%.4f', sdc_iter, max_diff_norm, residual_norm);
+                    end
                     
+                    % 检查收敛条件
                     if max_diff_norm < obj.SDCTolerance
                         fprintf(' -> Converged.\n');
                         break;
@@ -135,25 +172,51 @@ classdef SDCSolver < handle
                     end
                 end
                 
-                % Advance
-                x_start = X_slab(:, end); 
-                globalTime = t_end;
-                currentHistory(slab_idx) = x_start(end);
+                % --- [High-Res Data Collection] ---
+                % 使用谱系数 (Lagrange Basis) 插值得到平滑曲线 (Dense Output)
                 
-                % Probe & Log
-                B_mag = 0;
+                % 1. 计算插值点的物理时间
+                t_plot_phys = t_start + (tau_plot + 1) / 2 * dt_slab;
+                
+                % 2. 插值电流 (X_slab 的最后一行是电流 I)
+                I_nodes = X_slab(end, :)';
+                I_plot = obj.interpolatePolynomial(ctx.Spectral.Nodes, I_nodes, tau_plot);
+                
+                % 3. 插值磁密 (先在 GLL 节点计算 B，再插值 B 的模值)
+                B_nodes = zeros(ctx.Spectral.NumNodes, 1);
                 if ~isempty(postProc)
-                    B_val = postProc.probeB(x_start(1:ctx.num_A), probePoint);
-                    B_mag = norm(B_val);
-                    probeB_History(slab_idx) = B_mag;
-                    fprintf('      [End of Slab] |B|=%.4f T, I=%.4f A\n', B_mag, full(x_start(end)));
+                    for k = 1:ctx.Spectral.NumNodes
+                        B_val = postProc.probeB(X_slab(1:ctx.num_A, k), probePoint);
+                        B_nodes(k) = norm(B_val);
+                    end
+                end
+                B_plot = obj.interpolatePolynomial(ctx.Spectral.Nodes, B_nodes, tau_plot);
+                
+                % 4. 拼接数据 (跳过第一个点以避免与上一 Slab 重复，除非是第一个 Slab)
+                if slab_idx == 1
+                    idx_start = 1;
+                else
+                    idx_start = 2;
                 end
                 
-                % Plot
+                full_time_list = [full_time_list; t_plot_phys(idx_start:end)];
+                full_current_list = [full_current_list; I_plot(idx_start:end)];
+                full_B_list = [full_B_list; B_plot(idx_start:end)];
+                
+                % --- Update State (更新状态，准备下一 Slab) ---
+                x_start = X_slab(:, end); % 取 Slab 最后一个节点作为下一起点
+                globalTime = t_end;
+                currentHistory(slab_idx) = x_start(end);
+                if ~isempty(postProc), probeB_History(slab_idx) = B_nodes(end); end
+                
+                if ~isempty(postProc)
+                    fprintf('      [End] |B|=%.4f T, I=%.4f A\n', B_nodes(end), full_current_list(end));
+                end
+                
+                % 实时绘图
                 if ~isempty(monitorHandle)
                     try
-                        monitorHandle(globalTime, x_start(end), ...
-                            cumsum(timeSteps(1:slab_idx)), currentHistory(1:slab_idx));
+                        monitorHandle(globalTime, x_start(end), full_time_list, full_current_list);
                         drawnow limitrate;
                     catch; end
                 end
@@ -163,103 +226,115 @@ classdef SDCSolver < handle
             info.FinalTime = globalTime;
             info.CurrentHistory = currentHistory;
             if ~isempty(postProc), info.ProbeB_History = probeB_History; end
+            
+            % 返回全波形数据
+            info.Time_Full = full_time_list;
+            info.Current_Full = full_current_list;
+            info.ProbeB_Full = full_B_list;
         end
     end
     
     methods (Access = private)
         
         function [X_new, max_diff_norm, final_res_norm] = performSISDCSweep(obj, X_k, x0, ctx)
-            % PERFORMSISDCSWEEP 执行一次半隐式谱延迟修正扫描
+            % PERFORMSISDCSWEEP 执行一次半隐式谱延迟修正扫描 (One SISDC Sweep)
+            %
+            % 原理: 
+            %   求解方程: u_{m} - u_{m-1} = \int_{t_{m-1}}^{t_m} F(u) dt
+            %   SISDC迭代格式: 
+            %   M*(u_{m}^{k+1} - u_{m-1}^{k+1}) - dt*F(u_{m}^{k+1}) = -dt*F(u_{m}^k) + Integral_Correction
+            %   即: Implicit_Euler(u^{k+1}) = Explicit_Terms(u^k) + Spectral_Integral_Error
             
             num_nodes = ctx.Spectral.NumNodes;
-            num_dofs = ctx.numTotalDofs;
             dt_slab = ctx.dt_slab;
             Q = ctx.Spectral.Q;
             nodes = ctx.Spectral.Nodes;
             
             X_new = zeros(size(X_k));
-            X_new(:, 1) = x0; % 起点固定
+            X_new(:, 1) = x0; % 起点固定 (IC)
             
             % 1. 计算上一轮解 X_k 在所有节点处的物理力 F(X_k)
-            fprintf('      - Calculating High-Order Integral Source...\n');
+            %    这是计算高阶积分修正项的基础
+            % fprintf('      - Calculating High-Order Integral Source...\n');
             F_k = obj.evaluateF(X_k, ctx); 
             
-            % 2. 计算积分项 I_mat = F_k * Q' * dt/2
+            % 2. 计算全段积分项 I_accum = Integral_{0}^{t} F(u^k)
             dt_half = dt_slab / 2.0;
-            I_accum = (F_k * Q.') * dt_half; % 全局积分
+            I_accum = (F_k * Q.') * dt_half;
             
             max_diff_norm = 0;
             final_res_norm = 0;
             
-            % 3. 序列扫描 (Sequential Sweep)
+            % 3. 序列扫描 (Sequential Sweep from m=2 to N)
             for m = 2:num_nodes
-                % 当前子步长
                 tau_curr = nodes(m);
                 tau_prev = nodes(m-1);
-                dt_sub = (tau_curr - tau_prev) * dt_half;
+                dt_sub = (tau_curr - tau_prev) * dt_half; % 当前子步长
                 
-                fprintf('      - Solving Node %d/%d (dt_sub=%.2e)...\n', m, num_nodes, dt_sub);
+                % 准备隐式方程的右端项 (RHS)
+                u_prev_new = X_new(:, m-1);   % 刚算出来的最新前一点值
+                f_curr_old = F_k(:, m);       % 上一轮迭代在本点的力
                 
-                % 准备隐式方程的右端项
-                u_prev_new = X_new(:, m-1);
-                f_curr_old = F_k(:, m);
-                
-                % 积分修正增量 (Correction Integral)
+                % 积分修正增量: (Integral_{0}^{m} - Integral_{0}^{m-1}) = Integral_{m-1}^{m}
                 int_delta = I_accum(:, m) - I_accum(:, m-1);
                 
-                % RHS = M * u_{m-1} - dt * F_old(u_m) + Integral
-                % 这里为了传递给 solveImplicitStep，我们构建 Constant_Term
-                % Constant_Term = M * u_prev_new + int_delta - dt_sub * f_curr_old
-                % (注意: evaluateF 返回的是 Force，不是 M^{-1}*Force)
+                % 构造常数右端向量 RHS_Vector
+                % 公式: M*u_{new} - dt*F(u_{new}) = M*u_{prev} + int_delta - dt*F(u_{old})
+                % 这里的 RHS_Vector 对应等式右边
                 
-                % 计算 M * u_prev_new
                 Scale = ctx.CircuitRowScale;
                 M_sys = ctx.M_sigma; 
                 [w_idx, ~, w_val] = find(ctx.W_vec);
                 
-                % M_tot 乘法 (手动处理以节省内存)
+                % 计算 M * u_prev
                 M_u_prev = M_sys * u_prev_new;
-                % 加上电路部分 M (L*I 和 W'*A)
                 I_prev = u_prev_new(end);
-                % 电路行: (W' * A) * Scale + (L * I) * Scale
-                % W_vec 是 FEM 到电路的耦合，也就是 W'
+                % 加上电路部分的 Mass (L*I 和 W'*A)
                 term_L = ctx.circuit.L * I_prev;
                 term_W = ctx.W_vec' * u_prev_new;
                 M_u_prev(end) = M_u_prev(end) + (term_L + term_W) * Scale;
-                % FEM 行: 电路对场的耦合 (+W*I_prev * Scale)? 
-                % 答: M 矩阵中，场方程没有对 I 的微分项(只有 K 有)。
-                % 场方程: M*dA/dt + K*A - W*I = 0.
-                % 所以场方程的 M 只有 M_sigma。
-                % 但是！在 M_cir_row 构建时，我们之前加上了 w_val。
-                % 让我们仔细检查 assemble invariant matrices:
-                % ctx.M_sigma 只有 mass weighted.
-                % 我们需要把 W * I 项加进去吗？不，W*I 是 stiffness 项 (无微分)。
-                % 所以场方程的 M 乘法只涉及 M_sigma。
                 
-                % 构造 Constant RHS Vector
                 RHS_Vector = M_u_prev + int_delta - dt_sub * f_curr_old;
                 
-                % 初始猜测 (使用上一轮的值)
-                u_guess = X_k(:, m);
+                % =========================================================
+                % [关键改进] 智能初值猜测 (Smart Initial Guess)
+                % =========================================================
+                % 策略:
+                %   1. 如果是 Sweep 1 (解还是平的): 利用时间连续性，猜测 u_m = u_{m-1} (Rolling Guess)。
+                %      这能极大加速涌流上升沿的求解 (避免从0猜起)。
+                %   2. 如果是 Sweep > 1: 使用上一轮迭代的值 u_m^k (Refining Guess)。
                 
-                % 执行局部牛顿迭代
+                dist_history = norm(X_k(:, m) - X_k(:, m-1));
+                
+                if dist_history < 1e-9 
+                    % Sweep 1: Rolling Guess
+                    u_guess = u_prev_new;
+                    % fprintf('        [Guess] Using Prev Node (Rolling)\n');
+                else
+                    % Sweep > 1: Refining Guess
+                    u_guess = X_k(:, m);
+                    % fprintf('        [Guess] Using Prev Sweep (Refining)\n');
+                end
+                
+                % 执行局部牛顿迭代 (Local Newton Solve)
                 [u_next, res_norm, iter_count] = obj.solveImplicitStep(u_guess, dt_sub, RHS_Vector, nodes(m), ctx);
                 
                 X_new(:, m) = u_next;
                 
-                % 记录误差
+                % 记录相对更新量
                 diff = norm(u_next - X_k(:, m)) / (norm(u_next) + 1e-6);
                 max_diff_norm = max(max_diff_norm, diff);
                 final_res_norm = max(final_res_norm, res_norm);
                 
-                fprintf('        -> Node %d Solved: %d Iters, Res=%.2e, Diff=%.2e\n', ...
-                    m, iter_count, res_norm, diff);
+                fprintf('        -> Node %d Solved: %d Iters, Res=%.2e\n', m, iter_count, res_norm);
             end
         end
         
         function F_val = evaluateF(obj, X_mat, ctx)
-            % 计算物理力 F(u) = -K*u - W*I + Source
-            % 对应方程: M * du/dt = F(u)
+            % EVALUATEF 计算物理方程的右端力项 F(u)
+            % 方程形式: M * du/dt = F(u)
+            % F(u) = -K(u)*u - C*u + W*I + V_source (Field)
+            %        V_source - R*I               (Circuit)
             
             num_nodes = size(X_mat, 2);
             num_dofs = ctx.numTotalDofs;
@@ -271,24 +346,21 @@ classdef SDCSolver < handle
             
             for m = 1:num_nodes
                 x = X_mat(:, m);
-                t = ctx.t_start + (ctx.Spectral.Nodes(m) + 1) * dt_half;
+                t = ctx.t_start + (ctx.Spectral.Nodes(m) + 1) * dt_half; % 物理时间
                 
-                % 计算 K_fem * A
+                % 计算非线性刚度项 K_fem * A
                 A_vec = x(1:ctx.num_A);
                 [~, R_fem] = obj.Assembler.assembleJacobian(ctx.space_A, A_vec, ctx.matLib, false);
                 
-                % 组装力向量
-                % F_field = - (K_fem*A + C*A - W*I)
-                % 注意符号: 标准方程 M*u' + K*u = Source => M*u' = Source - K*u
+                % 组装场方程力向量
+                % Force = -K*x - C*x + W*I
                 f_vec = sparse(num_dofs, 1);
                 f_vec(1:length(R_fem)) = -R_fem; 
                 f_vec = f_vec - C_tot * x;
-                f_vec = f_vec + ctx.W_vec * x(end); % +W*I
+                f_vec = f_vec + ctx.W_vec * x(end); % 电路对场的耦合 (+W*I)
                 
-                % 电路部分
-                % Eq: V - R*I - d/dt(Psi + L*I) = 0
-                % => d/dt(...) = V - R*I
-                % F_cir = (V - R*I)
+                % 组装电路方程力向量
+                % Circuit Eq: V - R*I - d/dt(...) = 0 => M_cir * dI/dt = V - R*I
                 V_src = ctx.circuit.V_source_func(t);
                 I_val = x(end);
                 f_cir = (V_src - ctx.circuit.R * I_val) * Scale;
@@ -299,8 +371,10 @@ classdef SDCSolver < handle
         end
         
         function [u_new, final_res, iter_count] = solveImplicitStep(obj, u_guess, dt, RHS_Vector, t_node, ctx)
-            % 求解局部非线性方程: M*u - dt*F(u) - RHS_Vector = 0
-            % [v12.3 Fix] 纯相对误差控制 (Pure Relative Error Control)
+            % SOLVEIMPLICITSTEP 求解局部非线性方程 (Local Nonlinear Solver)
+            % 方程: M*u - dt*F(u) - RHS_Vector = 0
+            % 方法: Newton-Raphson 迭代
+            % [v12.3 Fix] 纯相对误差控制，防止在数值底噪处死循环
             
             u_curr = u_guess;
             Scale = ctx.CircuitRowScale;
@@ -308,7 +382,7 @@ classdef SDCSolver < handle
             [w_idx, ~, w_val] = find(ctx.W_vec);
             num_dofs = ctx.numTotalDofs;
             
-            % M_tot (质量矩阵部分)
+            % 组装总质量矩阵 M_tot (Field Mass + Circuit Inductance + Coupling)
             M_cir_diag = sparse(num_dofs, num_dofs, ctx.circuit.L * Scale, num_dofs, num_dofs);
             M_row_coup = sparse(repmat(num_dofs, length(w_idx), 1), w_idx, w_val * Scale, num_dofs, num_dofs);
             M_tot = M_sys + M_cir_diag + M_row_coup;
@@ -318,7 +392,7 @@ classdef SDCSolver < handle
             res_norm_prev = 1e10;
             iter_count = 0;
             
-            % --- 收敛参数 ---
+            % --- 牛顿迭代收敛参数 ---
             % 只要残差相比初始值下降了 6 个数量级，即认为物理收敛
             REL_TOL = 1e-6;      
             
@@ -330,11 +404,12 @@ classdef SDCSolver < handle
             for iter = 1:MAX_ITERS
                 iter_count = iter;
                 
-                % 1. 组装 Jacobian 和 Residual
+                % 1. 组装当前状态的 Jacobian 和 Residual
                 A_vec = u_curr(1:ctx.num_A);
                 [K_fem_small, R_fem_base] = obj.Assembler.assembleJacobian(ctx.space_A, A_vec, ctx.matLib, true);
                 
-                % Residual = M*u + dt*(-Force) - RHS
+                % 计算 -Force 项 (用于 Residual)
+                % -Force = K*u + C*u - W*I + R*I - V
                 neg_Force = sparse(num_dofs, 1);
                 neg_Force(1:length(R_fem_base)) = R_fem_base;
                 neg_Force = neg_Force + (ctx.C_AP + ctx.C_AP') * u_curr;
@@ -346,6 +421,7 @@ classdef SDCSolver < handle
                 V_src = ctx.circuit.V_source_func(t_phys);
                 neg_Force(end) = (ctx.circuit.R * I_val - V_src) * Scale;
                 
+                % Residual = M*u + dt*(-Force) - RHS
                 Res = M_tot * u_curr + dt * neg_Force - RHS_Vector;
                 
                 res_norm = norm(Res);
@@ -355,8 +431,7 @@ classdef SDCSolver < handle
                 % 记录初始残差
                 if iter == 1
                     res_norm_init = res_norm;
-                    % 防止完美初值导致除零 (极罕见)
-                    if res_norm_init < 1e-20, res_norm_init = 1.0; end
+                    if res_norm_init < 1e-20, res_norm_init = 1.0; end % 防止除零
                 end
                 
                 % 计算相对误差 (相对于本步迭代的起点)
@@ -388,7 +463,8 @@ classdef SDCSolver < handle
                 
                 res_norm_prev = res_norm;
                 
-                % --- 求解更新 ---
+                % --- 2. 组装 Jacobian Matrix ---
+                % J = M + dt * d(-Force)/du
                 [ki, kj, kv] = find(K_fem_small);
                 K_fem = sparse(ki, kj, kv, num_dofs, num_dofs);
                 
@@ -399,6 +475,7 @@ classdef SDCSolver < handle
                 K_tan_tot = K_base + K_col_coup + K_cir_diag;
                 Jac = M_tot + dt * K_tan_tot;
                 
+                % --- 3. 求解线性系统 ---
                 [J_bc, Res_bc] = BoundaryCondition.applyDirichlet(Jac, Res, ctx.fixedDofs);
                 du = obj.LinearSolver.solve(J_bc, -Res_bc);
                 
@@ -414,7 +491,8 @@ classdef SDCSolver < handle
         end
         
         function scaleFactor = calculateCircuitScale(obj, ctx, dt)
-             % (保持不变)
+             % 计算电路方程的缩放因子 (Geo-Balance Heuristic)
+             % 目的: 使电路方程的对角元与 FEM 方程的对角元在数值上接近，减少条件数。
             nu_vec_hard = obj.getBoundNuVec(ctx, 'hard'); 
             K_hard = obj.Assembler.assembleStiffness(ctx.space_A, nu_vec_hard);
             diag_M = diag(ctx.M_sigma);
@@ -434,7 +512,7 @@ classdef SDCSolver < handle
         end
         
         function nu_vec = getBoundNuVec(obj, ctx, mode)
-             % (保持不变)
+             % 获取极限磁导率分布 (用于预条件子或缩放计算)
             meshTags = obj.Assembler.Mesh.RegionTags;
             numElems = length(meshTags);
             nu_vec = zeros(numElems, 1);
@@ -450,12 +528,46 @@ classdef SDCSolver < handle
                     val = mat.Nu_Linear;
                 else
                     if strcmp(mode, 'hard')
-                        val = nu0;
+                        val = nu0; % 空气/饱和
                     else
-                        val = nu0 / 1000.0;
+                        val = nu0 / 1000.0; % 高导磁
                     end
                 end
                 nu_vec(meshTags == tag) = val;
+            end
+        end
+        
+        function vals_interp = interpolatePolynomial(~, nodes, values, target_nodes)
+            % INTERPOLATEPOLYNOMIAL 拉格朗日多项式插值 (Lagrange Interpolation)
+            % 作用: 基于 GLL 节点上的离散解，重构出时间片内连续的多项式解。
+            % 输入:
+            %   nodes: 已知节点 (GLL points), [N x 1]
+            %   values: 已知节点上的值, [N x 1]
+            %   target_nodes: 需要插值的点 (Plot points), [M x 1]
+            % 输出:
+            %   vals_interp: 插值结果 [M x 1]
+            
+            N = length(nodes);
+            M = length(target_nodes);
+            vals_interp = zeros(M, 1);
+            
+            % 对每个目标点进行求值
+            for k = 1:M
+                t = target_nodes(k);
+                y = 0;
+                
+                % Lagrange Basis Sum: L(t) = sum( y_j * l_j(t) )
+                for j = 1:N
+                    % Compute l_j(t) = product( (t - x_i) / (x_j - x_i) )
+                    l_j = 1;
+                    for i = 1:N
+                        if i ~= j
+                            l_j = l_j * (t - nodes(i)) / (nodes(j) - nodes(i));
+                        end
+                    end
+                    y = y + values(j) * l_j;
+                end
+                vals_interp(k) = y;
             end
         end
     end
