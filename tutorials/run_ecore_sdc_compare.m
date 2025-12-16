@@ -97,7 +97,7 @@ probePoint = [0, 0, 0];
 fprintf('\n[Run 1] Standard BDF1 Solver (Fine Step)...\n');
 
 dt_bdf = 5e-4;           % 细步长 (0.4 ms)
-timeSim = 0.01;          % 仿真时长 (0.01 s, 半个周期)
+timeSim = 0.013;          % 仿真时长 (0.01 s, 半个周期)
 timeSteps_bdf = repmat(dt_bdf, round(timeSim/dt_bdf), 1);
 
 tic;
@@ -119,7 +119,7 @@ dt_slab = 6.6e-3;
 timeSteps_sdc = [dt_slab,timeSim-dt_slab];
 
 solver_sdc = SISDCSolver(assembler);
-solver_sdc.PolyOrder = 3;       % 多项式阶数 P=4 (5个节点)
+solver_sdc.PolyOrder = 4;       % 多项式阶数 P=4 (5个节点)
 solver_sdc.MaxSDCIters = 10;    % SDC 最大修正次数
 solver_sdc.SDCTolerance = 1e-3; % SDC 收敛容差 (相对/绝对混合判据)
 
