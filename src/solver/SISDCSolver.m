@@ -1,4 +1,4 @@
-classdef SDCSolver < handle
+classdef SISDCSolver < handle
     % SDCSOLVER 基于非线性序列扫描的 SDC 求解器 (v12.0 - Nonlinear SISDC + Full Logging)
     % 
     % 核心机制: Semi-Implicit SDC (SISDC)
@@ -16,7 +16,7 @@ classdef SDCSolver < handle
     end
     
     methods
-        function obj = SDCSolver(assembler)
+        function obj = SISDCSolver(assembler)
             % 构造函数：初始化组装器和线性求解器配置
             obj.Assembler = assembler;
             obj.LinearSolver = LinearSolver('Auto');

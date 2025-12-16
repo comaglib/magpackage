@@ -101,7 +101,7 @@ timeSim = 0.01;          % 仿真时长 (0.01 s, 半个周期)
 timeSteps_bdf = repmat(dt_bdf, round(timeSim/dt_bdf), 1);
 
 tic;
-solver_bdf = TransientBDF1Solver(assembler);
+solver_bdf = TransientBDF2Solver(assembler);
 solver_bdf.Tolerance = 1e-3; % BDF1 收敛容差
 [~, info_bdf] = solver_bdf.solve(space_A, space_P, matLib, sigmaMap, ...
                                  circuit, winding, timeSteps_bdf, ...
@@ -118,9 +118,9 @@ dt_slab = 6.6e-3;
 % timeSteps_sdc = repmat(dt_slab, round(timeSim/dt_slab), 1);
 timeSteps_sdc = [dt_slab,timeSim-dt_slab];
 
-solver_sdc = SDCSolver(assembler);
+solver_sdc = SISDCSolver(assembler);
 solver_sdc.PolyOrder = 3;       % 多项式阶数 P=4 (5个节点)
-solver_sdc.MaxSDCIters = 20;    % SDC 最大修正次数
+solver_sdc.MaxSDCIters = 10;    % SDC 最大修正次数
 solver_sdc.SDCTolerance = 1e-3; % SDC 收敛容差 (相对/绝对混合判据)
 
 tic;
@@ -155,12 +155,13 @@ plot(t_sdc_full*1e3, I_sdc_full, 'r-', 'LineWidth', 1.5, ...
     'DisplayName', sprintf('SDC (P=%d, Polynomial Fit)', solver_sdc.PolyOrder));
 
 % 标记真实的 GLL 计算节点，展示 SDC 是如何"以少胜多"的
-t_sdc_ends = cumsum(timeSteps_sdc);
-I_sdc_ends = info_sdc.CurrentHistory;
-plot(t_sdc_ends*1e3, I_sdc_ends, 'ro', 'MarkerFaceColor', 'w', 'MarkerSize', 6, ...
-    'DisplayName', 'SDC Slab Endpoints');
+% t_sdc_ends = cumsum(timeSteps_sdc);
+% I_sdc_ends = info_sdc.CurrentHistory;
+% plot(t_sdc_ends*1e3, I_sdc_ends, 'ro', 'MarkerFaceColor', 'w', 'MarkerSize', 6, ...
+%     'DisplayName', 'SDC Slab Endpoints');
 
 grid on;
+xlim([0,timeSim*1e3]);
 legend('Location', 'best');
 xlabel('Time (ms)'); ylabel('Current (A)');
 title(sprintf('Inrush Current: Dense BDF1 vs Coarse SDC (dt=%.1fms)', dt_slab*1e3));
@@ -171,7 +172,8 @@ plot(t_bdf*1e3, B_bdf, 'k-', 'LineWidth', 1.5, 'DisplayName', 'BDF1');
 hold on;
 plot(t_sdc_full*1e3, B_sdc_full, 'b-', 'LineWidth', 1.5, 'DisplayName', 'SDC (Smooth)');
 grid on;
-legend('Location', 'best');
+xlim([0,timeSim*1e3]);
+% legend('Location', 'best');
 xlabel('Time (ms)'); ylabel('|B| at Origin (T)');
 title('B-Field at Core Center');
 
