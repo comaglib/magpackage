@@ -371,10 +371,10 @@ classdef ISDCSolver < handle
         end
         
         function [u_new, final_res, iter_count] = solveImplicitStep(obj, u_guess, dt, RHS_Vector, t_node, ctx)
-            % SOLVEIMPLICITSTEP 求解局部非线性方程 (Local Nonlinear Solver)
-            % 方程: M*u - dt*F(u) - RHS_Vector = 0
-            % 方法: Newton-Raphson 迭代
-            % [v12.3 Fix] 纯相对误差控制，防止在数值底噪处死循环
+            % SOLVEIMPLICITSTEP 求解局部非线性方程 (Damped Newton + Stagnation Check)
+            % 求解: M*u - dt*F(u) - RHS_Vector = 0
+            % 方法: Newton-Raphson 迭代 (带回溯线搜索)
+            % [v12.3 Fix] 集成了线搜索以提高鲁棒性，同时保留了停滞检测防止死循环
             
             u_curr = u_guess;
             Scale = ctx.CircuitRowScale;
@@ -382,76 +382,60 @@ classdef ISDCSolver < handle
             [w_idx, ~, w_val] = find(ctx.W_vec);
             num_dofs = ctx.numTotalDofs;
             
-            % 组装总质量矩阵 M_tot (Field Mass + Circuit Inductance + Coupling)
+            % 组装总质量矩阵 M_tot
             M_cir_diag = sparse(num_dofs, num_dofs, ctx.circuit.L * Scale, num_dofs, num_dofs);
             M_row_coup = sparse(repmat(num_dofs, length(w_idx), 1), w_idx, w_val * Scale, num_dofs, num_dofs);
             M_tot = M_sys + M_cir_diag + M_row_coup;
             
+            % 缓存常数刚度部分 (用于 computeResidual 和 Jacobian 组装)
+            K_col_coup = sparse(w_idx, repmat(num_dofs, length(w_idx), 1), -w_val, num_dofs, num_dofs);
+            K_cir_diag = sparse(num_dofs, num_dofs, ctx.circuit.R * Scale, num_dofs, num_dofs);
+            K_const_part = ctx.C_AP + ctx.C_AP' + K_col_coup + K_cir_diag;
+            
             final_res = 1e10;
-            res_norm_init = 1.0; % 初始残差
+            res_norm_init = 1.0; 
             res_norm_prev = 1e10;
             iter_count = 0;
             
-            % --- 牛顿迭代收敛参数 ---
-            % 只要残差相比初始值下降了 6 个数量级，即认为物理收敛
             REL_TOL = 1e-6;      
-            
-            % 停滞容差: 如果某一步改善幅度小于 0.1%，说明到了数值底噪，强制停止
             STAG_TOL = 1e-3;     
-            
             MAX_ITERS = 15;
+            MIN_ALPHA = 1e-2; % 线搜索最小步长
+            
+            % 预先计算初始残差和刚度矩阵 (Iter 1 准备)
+            A_vec = u_curr(1:ctx.num_A);
+            [K_fem_small, R_fem_base] = obj.Assembler.assembleJacobian(ctx.space_A, A_vec, ctx.matLib, true);
+            
+            % 计算初始时刻的物理时间 (用于源项)
+            t_phys = ctx.t_start + (t_node + 1) * ctx.dt_slab / 2.0; 
+            
+            Res = obj.computeResidual(u_curr, R_fem_base, dt, RHS_Vector, t_phys, ctx, M_tot, K_const_part);
+            res_norm = norm(Res);
             
             for iter = 1:MAX_ITERS
                 iter_count = iter;
                 
-                % 1. 组装当前状态的 Jacobian 和 Residual
-                A_vec = u_curr(1:ctx.num_A);
-                [K_fem_small, R_fem_base] = obj.Assembler.assembleJacobian(ctx.space_A, A_vec, ctx.matLib, true);
-                
-                % 计算 -Force 项 (用于 Residual)
-                % -Force = K*u + C*u - W*I + R*I - V
-                neg_Force = sparse(num_dofs, 1);
-                neg_Force(1:length(R_fem_base)) = R_fem_base;
-                neg_Force = neg_Force + (ctx.C_AP + ctx.C_AP') * u_curr;
-                
-                I_val = u_curr(end);
-                neg_Force = neg_Force - ctx.W_vec * I_val; 
-                
-                t_phys = ctx.t_start + (t_node + 1) * ctx.dt_slab / 2.0; 
-                V_src = ctx.circuit.V_source_func(t_phys);
-                neg_Force(end) = (ctx.circuit.R * I_val - V_src) * Scale;
-                
-                % Residual = M*u + dt*(-Force) - RHS
-                Res = M_tot * u_curr + dt * neg_Force - RHS_Vector;
-                
-                res_norm = norm(Res);
-                
                 % --- 收敛判断逻辑 ---
-                
-                % 记录初始残差
                 if iter == 1
                     res_norm_init = res_norm;
-                    if res_norm_init < 1e-20, res_norm_init = 1.0; end % 防止除零
+                    if res_norm_init < 1e-20, res_norm_init = 1.0; end 
                 end
                 
-                % 计算相对误差 (相对于本步迭代的起点)
-                rel_err = res_norm / res_norm_init;
-                
                 % 1. 相对误差达标 -> 收敛
+                rel_err = res_norm / res_norm_init;
                 if rel_err < REL_TOL
                     final_res = res_norm;
-                    fprintf('          Newton Converged: RelErr=%.2e\n', rel_err);
+                    % fprintf('          Newton Converged: RelErr=%.2e\n', rel_err);
                     break;
                 end
                 
-                % 2. 绝对残差极小 -> 收敛 (兜底保护)
+                % 2. 绝对残差极小 -> 收敛
                 if res_norm < 1e-10
                     final_res = res_norm;
                     break;
                 end
                 
-                % 3. 停滞检测 -> 强制收敛
-                % 如果当前残差和上一步几乎没变 (下降停滞)，说明已经到了机器精度或模型精度的极限
+                % 3. 停滞检测 (保留原算法)
                 if iter > 1
                     improvement = (res_norm_prev - res_norm) / res_norm_prev;
                     if abs(improvement) < STAG_TOL
@@ -460,34 +444,102 @@ classdef ISDCSolver < handle
                         break;
                     end
                 end
-                
                 res_norm_prev = res_norm;
                 
-                % --- 2. 组装 Jacobian Matrix ---
-                % J = M + dt * d(-Force)/du
+                % --- 牛顿步计算 ---
+                
+                % 1. 组装 Jacobian (K_fem_small 已经在上一轮末尾或初始化时计算好)
                 [ki, kj, kv] = find(K_fem_small);
                 K_fem = sparse(ki, kj, kv, num_dofs, num_dofs);
                 
-                K_base = K_fem + ctx.C_AP + ctx.C_AP';
-                K_col_coup = sparse(w_idx, repmat(num_dofs, length(w_idx), 1), -w_val, num_dofs, num_dofs);
-                K_cir_diag = sparse(num_dofs, num_dofs, ctx.circuit.R * Scale, num_dofs, num_dofs);
-                
-                K_tan_tot = K_base + K_col_coup + K_cir_diag;
+                K_tan_tot = K_fem + K_const_part;
                 Jac = M_tot + dt * K_tan_tot;
                 
-                % --- 3. 求解线性系统 ---
+                % 2. 求解线性系统
                 [J_bc, Res_bc] = BoundaryCondition.applyDirichlet(Jac, Res, ctx.fixedDofs);
                 du = obj.LinearSolver.solve(J_bc, -Res_bc);
                 
-                u_curr = u_curr + du;
+                % 3. 回溯线搜索 (Backtracking Line Search)
+                alpha = 1.0;
+                u_next = u_curr;
+                Res_next = Res;
+                valid_step = false;
+                
+                while alpha > MIN_ALPHA
+                    u_try = u_curr + alpha * du;
+                    
+                    % 仅计算残差 (False: 不组装刚度矩阵)
+                    A_vec_try = u_try(1:ctx.num_A);
+                    [~, R_fem_try] = obj.Assembler.assembleJacobian(ctx.space_A, A_vec_try, ctx.matLib, false);
+                    
+                    Res_try = obj.computeResidual(u_try, R_fem_try, dt, RHS_Vector, t_phys, ctx, M_tot, K_const_part);
+                    res_norm_try = norm(Res_try);
+                    
+                    % 单调下降判据
+                    if res_norm_try < res_norm
+                        % 接受步长
+                        u_next = u_try;
+                        Res_next = Res_try;
+                        res_norm = res_norm_try; % 更新残差供下一次循环检查
+                        
+                        % **关键**: 成功后立即为下一次迭代组装 K_fem (True)
+                        [K_fem_small, ~] = obj.Assembler.assembleJacobian(ctx.space_A, A_vec_try, ctx.matLib, true);
+                        
+                        valid_step = true;
+                        break;
+                    else
+                        % 拒绝，减半步长
+                        alpha = alpha * 0.3;
+                    end
+                end
+                
+                if ~valid_step
+                    % 线搜索失败，强制更新一次并接受(避免死锁)
+                    u_curr = u_curr + du;
+                    final_res = res_norm; % 残差未下降
+                    % 下一次循环会触发 assembleJacobian (需手动补一次以防万一)
+                    A_vec = u_curr(1:ctx.num_A);
+                    [K_fem_small, ~] = obj.Assembler.assembleJacobian(ctx.space_A, A_vec, ctx.matLib, true);
+                    
+                    % 通常这里应该 break 或者继续尝试，但停滞检测会在下一轮捕获它
+                else
+                    u_curr = u_next;
+                    Res = Res_next;
+                end
             end
             
             u_new = u_curr;
             
-            % 只有当相对误差依然很大 (例如 > 0.1) 且发散时才警告
             if final_res / res_norm_init > 1e-1 && final_res > 1.0
                 fprintf('          [Warn] Local Newton stalled at high residual: Rel=%.2e\n', final_res / res_norm_init);
             end
+        end
+        
+        function Res = computeResidual(obj, u, R_fem, dt, RHS_Vector, t_phys, ctx, M_mat, K_const)
+            % 辅助函数: 计算残差 M*u - dt*F(u) - RHS
+            % F(u) = -R_fem - K_const*u + V_src
+            % R_fem: 非线性磁阻力向量 K(nu)*A
+            
+            % 1. 构造 -Force 向量
+            neg_Force = sparse(size(u,1), 1);
+            neg_Force(1:length(R_fem)) = R_fem;
+            
+            % 加上线性刚度力 (K_const * u)
+            % (K_const 包含了 C_AP, K_coupling, R_circuit)
+            neg_Force = neg_Force + K_const * u;
+            
+            % 修正电路源项 (V_source)
+            % F_circuit = (V - R I) * Scale
+            % neg_F_circuit = (R I - V) * Scale
+            % K_const 中已经包含了 R*I 的项
+            % 所以这里只需要减去 V * Scale
+            
+            V_src = ctx.circuit.V_source_func(t_phys);
+            neg_Force(end) = neg_Force(end) - V_src * ctx.CircuitRowScale;
+            
+            % 2. 计算最终残差
+            % Res = M*u + dt*neg_Force - RHS
+            Res = M_mat * u + dt * neg_Force - RHS_Vector;
         end
         
         function scaleFactor = calculateCircuitScale(obj, ctx, dt)

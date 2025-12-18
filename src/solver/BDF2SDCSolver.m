@@ -1,26 +1,28 @@
-classdef SDIRK2ISDCSolver < handle
-    % SDIRK2ISDCSolver 基于 SDIRK-2 扫除器的高阶 SDC 求解器 (Auto-Stagnation Fix)
+classdef BDF2SDCSolver < handle
+    % BDF2SDCSolver (v4.0) - SDIRK2 Start + BDF2 (The Robust High-Order Fix)
     % 
-    % 修复记录:
-    %   1. [Fix] 增加了智能停滞检测：当牛顿迭代陷入震荡或改进微弱时，自动提前退出，
-    %      避免死循环。
-    %   2. [Fix] 优化了收敛容差策略，适应变压器饱和区的剧烈非线性。
-    %   3. [Log] 调整了输出格式，详细展示每个节点的 Diff 和 Iter 情况。
+    % 核心改进 (v4.0):
+    %   1. [Integrator] 
+    %      - Node 2 (启动步): 改用 SDIRK-2 (2级2阶 L-stable)。
+    %        解决了 Trapezoidal 在饱和区发散的问题 (L-stability)，
+    %        同时解决了 Backward Euler 的精度不足导致的过冲问题 (2nd Order)。
+    %      - Node > 2: 保持 BDF2 (L-stable, 2nd Order)。
+    %   2. [Relaxation] 默认 0.75，平衡收敛速度与抗震荡能力。
     
     properties
         Assembler       % 有限元组装器
         LinearSolver    % 线性求解器
         
-        PolyOrder = 3        % 谱元阶数 P (3 -> 4 Nodes)
-        MaxSDCIters = 3      % SDC 扫描次数
-        SDCTolerance = 1e-5  % SDC 收敛容差
+        PolyOrder = 4        % 用户设定 P=4
+        MaxSDCIters = 10     % 最大迭代次数
+        SDCTolerance = 1e-5  % 收敛容差
+        Relaxation = 0.75    % 松弛因子
         
-        % SDIRK2 参数 (L-stable)
-        Gamma = 1 - 1/sqrt(2); 
+        Gamma = 1 - 1/sqrt(2); % SDIRK2 参数
     end
     
     methods
-        function obj = SDIRK2ISDCSolver(assembler)
+        function obj = BDF2SDCSolver(assembler)
             obj.Assembler = assembler;
             obj.LinearSolver = LinearSolver('Auto');
             obj.LinearSolver.MumpsSymmetry = 0; 
@@ -37,10 +39,11 @@ classdef SDIRK2ISDCSolver < handle
                                                  probePoint)
             
             fprintf('\n==========================================================\n');
-            fprintf('   SDIRK-2 SDC Solver (Robust Full-Newton + Stagnation Check)\n');
+            fprintf('   BDF2 SDC Solver (v4.0: SDIRK2-Start, P=%d, Relax=%.2f)\n', ...
+                obj.PolyOrder, obj.Relaxation);
             fprintf('==========================================================\n');
             
-            % --- 1. 初始化 ---
+            % --- 初始化 ---
             dofHandler = obj.Assembler.DofHandler;
             if ~dofHandler.DofMaps.isKey(space_A.toString()), dofHandler.distributeDofs(space_A); end
             if ~dofHandler.DofMaps.isKey(space_P.toString()), dofHandler.distributeDofs(space_P); end
@@ -53,7 +56,7 @@ classdef SDIRK2ISDCSolver < handle
             postProc = []; 
             if ~isempty(probePoint), postProc = PostProcessor(obj.Assembler); end
             
-            % --- 2. 谱元数据 ---
+            % --- 谱元数据 ---
             [gll_nodes, gll_weights] = SpectralTimeUtils.gll(obj.PolyOrder);
             ctx.Spectral.Nodes = gll_nodes; 
             ctx.Spectral.Weights = gll_weights;
@@ -63,7 +66,7 @@ classdef SDIRK2ISDCSolver < handle
             NumPlotPoints = 20; 
             tau_plot = linspace(-1, 1, NumPlotPoints)'; 
             
-            % --- 3. 组装不变矩阵 ---
+            % --- 组装不变矩阵 ---
             fprintf('   [Init] Assembling invariant matrices...\n');
             M_sigma_local = obj.Assembler.assembleMassWeighted(space_A, sigmaMap);
             [mi, mj, mv] = find(M_sigma_local);
@@ -81,7 +84,6 @@ classdef SDIRK2ISDCSolver < handle
             ctx.CircuitRowScale = obj.calculateCircuitScale(ctx, dt_init);
             fprintf('   [Init] Circuit Scale Factor = %.2e\n', ctx.CircuitRowScale);
             
-            % 预组装全局质量矩阵
             Scale = ctx.CircuitRowScale;
             [w_idx, ~, w_val] = find(ctx.W_vec);
             num_dofs = ctx.numTotalDofs;
@@ -117,17 +119,14 @@ classdef SDIRK2ISDCSolver < handle
                 ctx.dt_slab = dt_slab;
                 ctx.t_start = t_start;
                 
-                % 1. Initialization
                 X_slab = repmat(x_curr, 1, ctx.Spectral.NumNodes);
                 
-                % 2. SDC Sweep Loop
+                % SDC Sweep
                 for sdc_iter = 1:obj.MaxSDCIters
                     X_old = X_slab;
                     
-                    % 执行扫除
-                    [X_slab, max_diff_norm] = obj.performSDIRK2Sweep(X_old, x_curr, ctx);
+                    [X_slab, max_diff_norm] = obj.performRobustSweep(X_old, x_curr, ctx);
                     
-                    % 输出状态
                     if max_diff_norm < obj.SDCTolerance
                         fprintf('   Sweep %d: Update=%.2e [Converged]\n', sdc_iter, max_diff_norm);
                         break;
@@ -136,7 +135,7 @@ classdef SDIRK2ISDCSolver < handle
                     end
                 end
                 
-                % 3. Output
+                % Output
                 t_plot_phys = t_start + (tau_plot + 1) / 2 * dt_slab;
                 I_nodes = X_slab(end, :)';
                 I_plot = obj.interpolatePolynomial(ctx.Spectral.Nodes, I_nodes, tau_plot);
@@ -173,75 +172,108 @@ classdef SDIRK2ISDCSolver < handle
     
     methods (Access = private)
         
-        function [X_new, max_diff_norm] = performSDIRK2Sweep(obj, X_k, x0, ctx)
-            % PERFORMSDIRK2SWEEP 核心扫除函数
+        function [X_new, max_diff_norm] = performRobustSweep(obj, X_k, x0, ctx)
+            % 混合扫除: Node 2 (SDIRK2) + Node >2 (BDF2)
             
             num_nodes = ctx.Spectral.NumNodes;
             dt_slab = ctx.dt_slab;
             Q = ctx.Spectral.Q;
             nodes = ctx.Spectral.Nodes;
+            alpha = obj.Relaxation;
             gamma = obj.Gamma;
             
             X_new = zeros(size(X_k));
             X_new(:, 1) = x0; 
             
+            % 1. 高阶积分项
             F_k = obj.evaluateF_Batch(X_k, ctx); 
-            
             dt_half = dt_slab / 2.0;
             I_spec = (F_k * Q.') * dt_half; 
             
             max_diff_norm = 0;
             
-            % 逐节点推进
+            % 2. 逐节点推进
             for m = 2:num_nodes
-                h_sub = (nodes(m) - nodes(m-1)) * dt_half;
+                int_corr = I_spec(:, m) - I_spec(:, m-1);
                 u_prev_new = X_new(:, m-1);
+                h_curr = (nodes(m) - nodes(m-1)) * dt_half;
                 
-                % --- SDC Source ---
-                tau_m_prev = nodes(m-1);
-                tau_m = nodes(m);
-                tau_gamma = tau_m_prev + gamma * (tau_m - tau_m_prev);
+                if m == 2
+                    % --- Step 1: SDIRK-2 (L-stable, 2nd Order) ---
+                    % Equation: u' = F(u) + sigma, where sigma = int_corr/h - F_k_avg
+                    % We assume sigma is constant over the step.
+                    % SDIRK2 has 2 stages.
+                    
+                    % 估算源项 sigma (SDC Correction)
+                    % 使用简单的平均近似: sigma = (int_corr)/h - (F_k_curr + F_k_prev)/2
+                    F_k_curr = F_k(:, m); 
+                    F_k_prev = F_k(:, m-1);
+                    sigma = int_corr/h_curr - (F_k_curr + F_k_prev)/2.0;
+                    
+                    % SDIRK Stage 1: Solve g1
+                    % M(g1 - u0)/(gamma*h) = F(g1) + sigma
+                    dt_stg = h_curr * gamma;
+                    M_u_prev = ctx.M_full_const * u_prev_new;
+                    RHS_1 = M_u_prev + dt_stg * sigma;
+                    
+                    % Solve Stage 1
+                    t_g1 = ctx.t_start + (nodes(m-1) + gamma*(nodes(m)-nodes(m-1)) + 1)*dt_half;
+                    [g1, ~, ~] = obj.solveImplicitStep(u_prev_new, dt_stg, RHS_1, t_g1, ctx);
+                    
+                    % Evaluate F(g1)
+                    F_g1 = obj.evaluateF_Single(g1, t_g1, ctx);
+                    
+                    % SDIRK Stage 2: Solve u_next
+                    % M(u_next - u0)/h = (1-gamma)(F(g1)+sigma) + gamma(F(u_next)+sigma)
+                    % RHS_2 = M*u0 + h*(1-gamma)*F(g1) + h*sigma
+                    term_explicit = h_curr * (1-gamma) * F_g1;
+                    term_source   = h_curr * sigma;
+                    RHS_2 = M_u_prev + term_explicit + term_source;
+                    
+                    dt_eff = h_curr * gamma;
+                    method_tag = 'SDIRK2';
+                    
+                    % Solve Stage 2
+                    t_end = ctx.t_start + (nodes(m) + 1)*dt_half;
+                    [u_calc, ~, iters] = obj.solveImplicitStep(g1, dt_eff, RHS_2, t_end, ctx);
+                    
+                else
+                    % --- Step >= 2: BDF2 (L-stable, 2nd Order) ---
+                    h_prev = (nodes(m-1) - nodes(m-2)) * dt_half;
+                    r = h_curr / h_prev;
+                    
+                    a0 = (1 + 2*r) / (1 + r);
+                    a1 = -(1 + r);
+                    a2 = (r^2) / (1 + r);
+                    
+                    u_m2_new = X_new(:, m-2);
+                    F_k_curr = F_k(:, m);
+                    
+                    M_hist = ctx.M_full_const * (a1*u_prev_new + a2*u_m2_new); 
+                    
+                    % Source: sigma = int_corr/h - F(u_m^k)
+                    sigma = int_corr/h_curr - F_k_curr;
+                    RHS = -M_hist + h_curr * sigma;
+                    
+                    dt_eff = h_curr / a0; 
+                    RHS = RHS / a0;
+                    method_tag = 'BDF2  ';
+                    
+                    dist = norm(X_k(:,m) - X_k(:,m-1));
+                    if dist < 1e-9, u_guess = u_prev_new; else, u_guess = X_k(:,m); end
+                    
+                    t_end = ctx.t_start + (nodes(m) + 1)*dt_half;
+                    [u_calc, ~, iters] = obj.solveImplicitStep(u_guess, dt_eff, RHS, t_end, ctx);
+                end
                 
-                u_k_gamma = obj.interpolateStateSingle(nodes, X_k, tau_gamma);
-                t_phys_gamma = ctx.t_start + (tau_gamma + 1) * dt_half;
-                t_phys_end   = ctx.t_start + (tau_m + 1) * dt_half;
+                % Relaxation
+                u_relaxed = (1 - alpha) * X_k(:, m) + alpha * u_calc;
+                X_new(:, m) = u_relaxed;
                 
-                F_k_gamma = obj.evaluateF_Single(u_k_gamma, t_phys_gamma, ctx);
-                F_k_end   = F_k(:, m); 
-                
-                I_low = h_sub * ((1-gamma) * F_k_gamma + gamma * F_k_end);
-                I_high = I_spec(:, m) - I_spec(:, m-1);
-                sigma = (I_high - I_low) / h_sub;
-                
-                % --- Stage 1 ---
-                dt_eff = h_sub * gamma;
-                M_u_prev = ctx.M_full_const * u_prev_new;
-                RHS_1 = M_u_prev + dt_eff * sigma;
-                
-                dist_hist = norm(X_k(:,m) - X_k(:,m-1));
-                if dist_hist < 1e-9, u_guess = u_prev_new; else, u_guess = X_k(:,m); end
-                
-                % Solve Stage 1
-                [g1, ~, iter1] = obj.solveImplicitStep(u_guess, dt_eff, RHS_1, t_phys_gamma, ctx);
-                fprintf('      [Node %d Stage 1] ', m);
-                
-                F_phys_g1 = obj.evaluateF_Single(g1, t_phys_gamma, ctx);
-                
-                % --- Stage 2 ---
-                term_F_g1 = h_sub * (1-gamma) * F_phys_g1;
-                term_sigma = h_sub * sigma;
-                RHS_2 = M_u_prev + term_F_g1 + term_sigma;
-                
-                % Solve Stage 2
-                [u_next, ~, iter2] = obj.solveImplicitStep(g1, dt_eff, RHS_2, t_phys_end, ctx);
-                
-                X_new(:, m) = u_next;
-                
-                diff = norm(u_next - X_k(:, m)) / (norm(u_next) + 1e-6);
+                diff = norm(u_relaxed - X_k(:, m)) / (norm(u_relaxed) + 1e-6);
                 max_diff_norm = max(max_diff_norm, diff);
                 
-                fprintf('      [Node %d Stage 2]         Node %d Done. Iters=%d/%d, Diff=%.2e\n', ...
-                    m, m, iter1, iter2, diff);
+                fprintf('      [Node %d (%s)] Iters=%d, Diff=%.2e\n', m, method_tag, iters, diff);
             end
         end
         
@@ -273,8 +305,6 @@ classdef SDIRK2ISDCSolver < handle
         end
         
         function [u_new, final_res, iter_count] = solveImplicitStep(obj, u_guess, dt, RHS_Vector, t_phys, ctx)
-            % 局部牛顿求解器 (Full Newton with Stagnation Check)
-            
             u_curr = u_guess;
             num_dofs = ctx.numTotalDofs;
             Scale = ctx.CircuitRowScale;
@@ -284,81 +314,47 @@ classdef SDIRK2ISDCSolver < handle
             K_cir_diag = sparse(num_dofs, num_dofs, ctx.circuit.R * Scale, num_dofs, num_dofs);
             K_const_part = ctx.C_AP + ctx.C_AP' + K_col_coup + K_cir_diag;
             
-            final_res = 1e10;
-            res_norm_init = 1.0; res_norm_prev = 1e10;
-            
-            MAX_ITERS = 15;
-            STAGNATION_TOL = 1e-3; % 改善率阈值 (0.1%)
+            final_res = 1e10; res_norm_init = 1.0; res_norm_prev = 1e10;
+            MAX_ITERS = 15; STAGNATION_TOL = 1e-3;
             
             for iter = 1:MAX_ITERS
                 iter_count = iter;
                 A_vec = u_curr(1:ctx.num_A);
-                
                 [K_fem_small, R_fem_base] = obj.Assembler.assembleJacobian(ctx.space_A, A_vec, ctx.matLib, true);
                 
                 neg_Force = sparse(num_dofs, 1);
                 neg_Force(1:length(R_fem_base)) = R_fem_base;
                 neg_Force = neg_Force + (ctx.C_AP + ctx.C_AP') * u_curr;
                 neg_Force = neg_Force - ctx.W_vec * u_curr(end); 
-                
                 V_src = ctx.circuit.V_source_func(t_phys);
                 neg_Force(end) = (ctx.circuit.R * u_curr(end) - V_src) * Scale;
                 
                 Res = ctx.M_full_const * u_curr + dt * neg_Force - RHS_Vector;
                 res_norm = norm(Res);
                 
-                % --- 收敛判据 ---
                 if iter == 1, res_norm_init = res_norm; if res_norm_init < 1e-20, res_norm_init=1; end; end
                 
-                % 1. 绝对/相对收敛
                 if res_norm / res_norm_init < 1e-5 || res_norm < 1e-8
                     final_res = res_norm; break; 
                 end
                 
-                % 2. 停滞检测 (Stagnation Check)
                 if iter > 1
                     improvement = (res_norm_prev - res_norm) / res_norm_prev;
-                    % 如果改善微弱
                     if improvement < STAGNATION_TOL
-                        % 如果残差已经比较小 (e.g. 1e-2)，可以接受停滞并退出
-                        % 对于饱和变压器，残差卡在 1e-3 ~ 1e-2 是常态
-                        if res_norm < 1e-1
-                             final_res = res_norm; 
-                             fprintf('(Stag:%.1e) ', res_norm); % Debug
-                             break;
-                        else
-                             % 残差过大但停滞，也没必要继续算，退出并标记
-                             fprintf('(HighStag:%.1e) ', res_norm); 
-                             final_res = res_norm; break;
-                        end
+                        final_res = res_norm; break;
                     end
                 end
                 res_norm_prev = res_norm;
                 
-                % --- 求解更新 ---
                 [ki, kj, kv] = find(K_fem_small);
                 K_fem = sparse(ki, kj, kv, num_dofs, num_dofs);
                 Jac = ctx.M_full_const + dt * (K_fem + K_const_part);
                 
                 [J_bc, Res_bc] = BoundaryCondition.applyDirichlet(Jac, Res, ctx.fixedDofs);
                 du = obj.LinearSolver.solve(J_bc, -Res_bc);
-                
                 u_curr = u_curr + du;
             end
-            
             u_new = u_curr;
-        end
-        
-        function u_interp = interpolateStateSingle(~, nodes, X_mat, tau_target)
-            N = length(nodes);
-            u_interp = zeros(size(X_mat, 1), 1);
-            for j = 1:N
-                lj = 1;
-                for i = 1:N
-                    if i ~= j, lj = lj * (tau_target - nodes(i)) / (nodes(j) - nodes(i)); end
-                end
-                u_interp = u_interp + X_mat(:, j) * lj;
-            end
         end
         
         function scaleFactor = calculateCircuitScale(obj, ctx, dt)

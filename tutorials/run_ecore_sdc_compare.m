@@ -2,17 +2,17 @@
 % =========================================================================
 % E-Core 变压器瞬态分析对比测试脚本
 % 对比对象：
-%   1. 标准 BDF1 求解器 (TransientCoupledSolver) - 作为基准 (Reference)
+%   1. 标准 BDF2 求解器 (TransientCoupledSolver) - 作为基准 (Reference)
 %   2. 高阶 SDC 求解器 (SDCSolver)               - 待验证的高阶算法
 %
 % 测试目标：
-%   验证 SDC 算法在粗时间步长下，能否达到与细步长 BDF1 相当甚至更高的精度，
+%   验证 SDC 算法在粗时间步长下，能否达到与细步长 BDF2 相当甚至更高的精度，
 %   特别是针对变压器涌流这种强非线性刚性问题。
 % =========================================================================
 
 clear; clc;
 fprintf('=========================================================\n');
-fprintf('   Comparison: Standard BDF1 vs High-Order SDC           \n');
+fprintf('   Comparison: Standard BDF2 vs High-Order SDC           \n');
 fprintf('=========================================================\n');
 
 %% --- 1. 模型共享设置 (Mesh & Physics) ---
@@ -75,15 +75,15 @@ dofHandler.distributeDofs(space_P);
 [center, radius, area_S, axis_idx] = CoilGeometryUtils.autoDetectCircular(mesh, NEW_TAG_PRIM);
 dir_map = -1.0 * CoilGeometryUtils.computeCircularDirection(mesh, NEW_TAG_PRIM, center, axis_idx);
 
-winding = Winding('Primary', NEW_TAG_PRIM, 3000, 10, area_S, [0,0,0]);
+winding = Winding('Primary', NEW_TAG_PRIM, 3000, 7, area_S, [0,0,0]);
 winding.setDirectionField(dir_map);
 
 % 1.6 外电路参数
 circuit = struct();
-circuit.R = 10; % 电阻 (Ohm)
+circuit.R = 7;  % 电阻 (Ohm)
 circuit.L = 0;  % 漏电感 (H)
 % 电压源: 500V, 50Hz 正弦波
-circuit.V_source_func = @(t) 800 * sin(2 * pi * 50 * t);
+circuit.V_source_func = @(t) 1500 * sin(2 * pi * 50 * t);
 
 % 1.7 边界条件与组装器
 fixedDofs_A = BoundaryCondition.findOuterBoundaryDofs(mesh, dofHandler, space_A);
@@ -93,35 +93,18 @@ assembler = Assembler(mesh, dofHandler);
 % 探针位置 (铁芯中心)
 probePoint = [0, 0, 0]; 
 
-%% --- 2. 运行 BDF1 (Reference) ---
-fprintf('\n[Run 1] Standard BDF1 Solver (Fine Step)...\n');
-
-dt_bdf = 5e-4;            % 细步长 (0.4 ms)
-timeSim = 0.013;          % 仿真时长 (0.01 s, 半个周期)
-timeSteps_bdf = repmat(dt_bdf, round(timeSim/dt_bdf), 1);
-
-% tic;
-% solver_bdf = TransientBDF2Solver(assembler);
-% solver_bdf.Tolerance = 1e-3; % BDF1 收敛容差
-% [~, info_bdf] = solver_bdf.solve(space_A, space_P, matLib, sigmaMap, ...
-%                                  circuit, winding, timeSteps_bdf, ...
-%                                  fixedDofs_A, fixedDofs_P, [], [], probePoint);
-% time_bdf = toc;
-% fprintf('-> BDF1 Completed in %.2f seconds.\n', time_bdf);
-
-%% --- 3. 运行 SDC (High-Order) ---
+%% --- 2. 运行 SDC (High-Order) ---
 fprintf('\n[Run 2] High-Order SDC Solver (Coarse Step)...\n');
 
 % SDC 策略: 
-dt_slab = 4.5e-3;
-% timeSteps_sdc = repmat(dt_slab, round(timeSim/dt_slab), 1);
+timeSim = 0.013;     % 仿真时长
+dt_slab = 3.5e-3;    % 4.5e-3; 3.5e-3;
 timeSteps_sdc = [dt_slab,timeSim-dt_slab];
-% timeSteps_sdc = [4.5e-3,4.5e-3,timeSim-9e-3];
 
-solver_sdc = SDIRK2ISDCSolver(assembler);
-solver_sdc.PolyOrder = 4;       % 多项式阶数 P=3 (4个节点)
+solver_sdc = AcISDCSolver(assembler);
+solver_sdc.PolyOrder = 4;       % 多项式阶数 P=4 (5个节点)
 solver_sdc.MaxSDCIters = 10;    % SDC 最大修正次数
-solver_sdc.SDCTolerance = 1e-3; % SDC 收敛容差 (相对/绝对混合判据)
+solver_sdc.SDCTolerance = 1e-4; % SDC 收敛容差 (相对/绝对混合判据)
 
 tic;
 [~, info_sdc] = solver_sdc.solve(space_A, space_P, matLib, sigmaMap, ...
@@ -130,58 +113,73 @@ tic;
 time_sdc = toc;
 fprintf('-> SDC Completed in %.2f seconds.\n', time_sdc);
 
+%% --- 3. 运行 BDF2 (Reference) ---
+fprintf('\n[Run 1] Standard BDF2 Solver (Fine Step)...\n');
+
+dt_bdf = 1e-3;            % 细步长 (0.4 ms)
+timeSteps_bdf = repmat(dt_bdf, round(timeSim/dt_bdf), 1);
+
+tic;
+solver_bdf = TransientBDF2Solver(assembler);
+solver_bdf.Tolerance = 1e-3; % BDF2 收敛容差
+[~, info_bdf] = solver_bdf.solve(space_A, space_P, matLib, sigmaMap, ...
+                                 circuit, winding, timeSteps_bdf, ...
+                                 fixedDofs_A, fixedDofs_P, [], [], probePoint);
+time_bdf = toc;
+fprintf('-> BDF2 Completed in %.2f seconds.\n', time_bdf);
+
 %% --- 4. 结果对比绘图 ---
 fprintf('\n[Post] Plotting comparison...\n');
 
-% BDF1 (Reference)
-% t_bdf = cumsum(timeSteps_bdf);
-% I_bdf = info_bdf.CurrentHistory;
-% B_bdf = info_bdf.ProbeB_History;
+% BDF2 (Reference)
+t_bdf = cumsum(timeSteps_bdf);
+I_bdf = info_bdf.CurrentHistory;
+B_bdf = info_bdf.ProbeB_History;
 
 % SDC (High-Res Interpolated)
 t_sdc_full = info_sdc.Time_Full;
 I_sdc_full = info_sdc.Current_Full;
 B_sdc_full = info_sdc.ProbeB_Full;
 
-figure('Name', 'BDF1 vs SDC Comparison', 'Position', [200, 200, 1000, 600]);
+figure('Name', 'BDF2 vs SDC Comparison', 'Position', [200, 200, 1000, 600]);
 
 % 子图 1: 电流对比
 subplot(2, 1, 1);
-% 绘制 BDF1 参考线
-% plot(t_bdf*1e3, I_bdf, 'k-', 'LineWidth', 1.5, 'DisplayName', 'BDF1 (Ref)');
+% 绘制 BDF2 参考线
+plot(t_bdf*1e3, I_bdf, 'k-', 'LineWidth', 1.5, 'DisplayName', 'BDF2 (Ref)');
 hold on;
 % 绘制 SDC 全波形 (插值后的光滑曲线)
 plot(t_sdc_full*1e3, I_sdc_full, 'r-', 'LineWidth', 1.5, ...
     'DisplayName', sprintf('SDC (P=%d, Polynomial Fit)', solver_sdc.PolyOrder));
 
 % 标记真实的 GLL 计算节点，展示 SDC 是如何"以少胜多"的
-t_sdc_ends = cumsum(timeSteps_sdc);
-I_sdc_ends = info_sdc.CurrentHistory;
-plot(t_sdc_ends*1e3, I_sdc_ends, 'ro', 'MarkerFaceColor', 'w', 'MarkerSize', 6, ...
-    'DisplayName', 'SDC Slab Endpoints');
+% t_sdc_ends = cumsum(timeSteps_sdc);
+% I_sdc_ends = info_sdc.CurrentHistory;
+% plot(t_sdc_ends*1e3, I_sdc_ends, 'ro', 'MarkerFaceColor', 'w', 'MarkerSize', 6, ...
+%     'DisplayName', 'SDC Slab Endpoints');
 
 grid on;
 xlim([0,timeSim*1e3]);
-% legend('Location', 'best');
+legend('Location', 'best');
 xlabel('Time (ms)'); ylabel('Current (A)');
-title(sprintf('Inrush Current: Dense BDF1 vs Coarse SDC (dt=%.1fms)', dt_slab*1e3));
+title(sprintf('Inrush Current: Dense BDF2 vs Coarse SDC (dt=%.1fms)', dt_slab*1e3));
 
 % 子图 2: 磁密对比
 subplot(2, 1, 2);
-% plot(t_bdf*1e3, B_bdf, 'k-', 'LineWidth', 1.5, 'DisplayName', 'BDF1');
+plot(t_bdf*1e3, B_bdf, 'k-', 'LineWidth', 1.5, 'DisplayName', 'BDF2');
 hold on;
 plot(t_sdc_full*1e3, B_sdc_full, 'b-', 'LineWidth', 1.5, 'DisplayName', 'SDC (Smooth)');
 grid on;
 xlim([0,timeSim*1e3]);
-% legend('Location', 'best');
+legend('Location', 'best');
 xlabel('Time (ms)'); ylabel('|B| at Origin (T)');
 title('B-Field at Core Center');
 
 % 误差分析
-% I_bdf_interp = interp1([0; t_bdf], [0; I_bdf], t_sdc_full, 'linear', 'extrap');
-% rel_err_norm = norm(I_sdc_full - I_bdf_interp) / norm(I_bdf_interp);
+I_bdf_interp = interp1([0; t_bdf], [0; I_bdf], t_sdc_full, 'linear', 'extrap');
+rel_err_norm = norm(I_sdc_full - I_bdf_interp) / norm(I_bdf_interp);
 
-% fprintf('\n--- Accuracy Report ---\n');
-% fprintf('Relative Error (Curve Match): %.2e%%\n', rel_err_norm * 100);
+fprintf('\n--- Accuracy Report ---\n');
+fprintf('Relative Error (Curve Match): %.2e%%\n', rel_err_norm * 100);
 
 fprintf('\nDone.\n');
