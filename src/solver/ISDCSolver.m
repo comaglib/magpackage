@@ -1,7 +1,7 @@
-classdef SISDCSolver < handle
-    % SDCSOLVER 基于非线性序列扫描的 SDC 求解器 (v12.0 - Nonlinear SISDC + Full Logging)
+classdef ISDCSolver < handle
+    % ISDCSolver 基于非线性序列扫描的 SDC 求解器 (v12.0 - Nonlinear ISDC + Full Logging)
     % 
-    % 核心机制: Semi-Implicit SDC (SISDC)
+    % 核心机制: Implicit SDC (ISDC)
     %   1. 不做全局线性化预测，而是沿着 GLL 节点逐个求解非线性方程 (Sequential Sweeping)。
     %   2. 每个子步本质上是一个 "带高阶源项修正的 Backward Euler" (L-stable)。
     %   3. 这种方法对变压器饱和等刚性问题极其稳健 (Stiff & Nonlinear)。
@@ -11,12 +11,12 @@ classdef SISDCSolver < handle
         LinearSolver    % Linear Solver Wrapper (线性求解器，如 MUMPS)
         
         PolyOrder = 3        % 多项式阶数 P (建议 3 或 4)。决定了每个 Time Slab 内有 P+1 个 GLL 节点。
-        MaxSDCIters = 5      % SDC 扫描次数 K (SISDC 收敛很快，通常 5 次足够将误差降至底噪)。
+        MaxSDCIters = 5      % SDC 扫描次数 K (ISDC 收敛很快，通常 5 次足够将误差降至底噪)。
         SDCTolerance = 1e-4  % SDC 收敛容差 (用于提前退出扫描循环)。
     end
     
     methods
-        function obj = SISDCSolver(assembler)
+        function obj = ISDCSolver(assembler)
             % 构造函数：初始化组装器和线性求解器配置
             obj.Assembler = assembler;
             obj.LinearSolver = LinearSolver('Auto');
@@ -44,7 +44,7 @@ classdef SISDCSolver < handle
             %   probePoint: 磁密探测点坐标
             
             fprintf('==================================================\n');
-            fprintf('   SDC Solver (Nonlinear SISDC, P=%d)\n', obj.PolyOrder);
+            fprintf('   SDC Solver (Nonlinear ISDC, P=%d)\n', obj.PolyOrder);
             fprintf('==================================================\n');
             
             % --- 1. 初始化与预计算 (Initialization & Pre-computation) ---
@@ -154,7 +154,7 @@ classdef SISDCSolver < handle
                 for sdc_iter = 1:obj.MaxSDCIters
                     X_old = X_slab;
                     % 调用核心扫描函数
-                    [X_slab, max_diff_norm, residual_norm] = obj.performSISDCSweep(X_old, x_start, ctx);
+                    [X_slab, max_diff_norm, residual_norm] = obj.performISDCSweep(X_old, x_start, ctx);
                     
                     % 打印收敛信息
                     if max_diff_norm < 1e-4
@@ -236,12 +236,12 @@ classdef SISDCSolver < handle
     
     methods (Access = private)
         
-        function [X_new, max_diff_norm, final_res_norm] = performSISDCSweep(obj, X_k, x0, ctx)
-            % PERFORMSISDCSWEEP 执行一次半隐式谱延迟修正扫描 (One SISDC Sweep)
+        function [X_new, max_diff_norm, final_res_norm] = performISDCSweep(obj, X_k, x0, ctx)
+            % PERFORMISDCSWEEP 执行一次隐式谱延迟修正扫描 (One ISDC Sweep)
             %
             % 原理: 
             %   求解方程: u_{m} - u_{m-1} = \int_{t_{m-1}}^{t_m} F(u) dt
-            %   SISDC迭代格式: 
+            %   ISDC迭代格式: 
             %   M*(u_{m}^{k+1} - u_{m-1}^{k+1}) - dt*F(u_{m}^{k+1}) = -dt*F(u_{m}^k) + Integral_Correction
             %   即: Implicit_Euler(u^{k+1}) = Explicit_Terms(u^k) + Spectral_Integral_Error
             

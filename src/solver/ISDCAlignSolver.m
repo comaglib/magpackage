@@ -1,24 +1,28 @@
-classdef SISDCC1Solver < handle
-    % SISDCC1SOLVER 支持 C1 连续预测的 SISDC 求解器 (v13.0 - C1 Predictor)
+classdef ISDCAlignSolver < handle
+    % ISDCAlignSolver 基于波形拐点对齐的自适应 SDC 求解器 (v1.0)
     % 
-    % 继承自 SISDCSolver 架构，改进了时间片连接处的连续性。
-    % 核心改进:
-    %   1. C1 Predictor: 利用上一时间步的导数信息进行线性外推作为初值猜测。
-    %      消除时间片连接处的 "Kinks" (折角)，显著减少启动时的迭代误差。
-    %   2. Spectral Differentiation: 利用谱微分矩阵高精度计算末端导数。
+    % 核心特性:
+    %   1. Grid Alignment: 自动检测波形拐点(如饱和起始点)，并将时间步边界对齐到拐点。
+    %      这消除了高阶多项式拟合非光滑拐点时的 Gibbs 振荡，解决了收敛困难。
+    %   2. Low-Cost Probe: 利用单次扫描(Sweep 1)的结果快速判断波形特征。
+    %   3. Curvature Detection: 利用二阶导数极值定位拐点。
+    %   4. Robust Predictor: 采用 C1 预测结合有限差分导数，保证刚性问题的稳定性。
     
     properties
         Assembler       % Finite Element Assembler
         LinearSolver    % Linear Solver Wrapper
         
-        PolyOrder = 3        % 多项式阶数 P
-        MaxSDCIters = 5      % SDC 扫描次数
-        SDCTolerance = 1e-4  % SDC 收敛容差
+        PolyOrder = 3        % 多项式阶数 (建议 3 或 4)
+        MaxSDCIters = 10     % 最大扫描次数
+        SDCTolerance = 1e-4  % 收敛容差
+        
+        % --- 自适应控制参数 ---
+        CurvatureThreshold = 100.0  % 曲率阈值 (判定拐点灵敏度，需根据电流幅值调整)
+        MinStepSize = 1e-6          % 最小允许步长 (防止过度切分)
     end
     
     methods
-        function obj = SISDCC1Solver(assembler)
-            % 构造函数
+        function obj = ISDCAlignSolver(assembler)
             obj.Assembler = assembler;
             obj.LinearSolver = LinearSolver('Auto');
             obj.LinearSolver.MumpsSymmetry = 0; 
@@ -28,15 +32,16 @@ classdef SISDCC1Solver < handle
         function [solutionResults, info] = solve(obj, space_A, space_P, ...
                                                  matLib, sigmaMap, ...
                                                  circuitProps, windingObj, ...
-                                                 timeSteps, ...
+                                                 dt_preset, t_max, ... 
                                                  fixedDofs_A, fixedDofs_P, ...
                                                  init_State, ...
                                                  monitorHandle, ...
                                                  probePoint)
-            % SOLVE 主求解函数 (带 C1 预测逻辑)
+            % SOLVE 主求解函数
+            % 输入变化: 接收 dt_preset (预设步长) 和 t_max (总时间)，而非固定数组
             
             fprintf('==================================================\n');
-            fprintf('   SDC Solver (C1 Continuous Predictor, P=%d)\n', obj.PolyOrder);
+            fprintf('   SDC Solver (Waveform Alignment, P=%d)\n', obj.PolyOrder);
             fprintf('==================================================\n');
             
             % --- 1. 初始化与预计算 ---
@@ -52,28 +57,19 @@ classdef SISDCC1Solver < handle
             postProc = []; 
             if ~isempty(probePoint), postProc = PostProcessor(obj.Assembler); end
             
-            full_time_list = []; full_current_list = []; full_B_list = [];
-            probeB_History = zeros(length(timeSteps), 1);
-            currentHistory = zeros(length(timeSteps), 1);
-            
-            % --- 2. 谱离散参数计算 ---
-            fprintf('   [Init] Computing GLL nodes, integration & differentiation matrices...\n');
+            % 预计算谱矩阵
+            fprintf('   [Init] Computing GLL nodes & matrices...\n');
             [gll_nodes, gll_weights] = SpectralTimeUtils.gll(obj.PolyOrder);
             Q_mat = SpectralTimeUtils.integration_matrix(gll_nodes);
-            
-            % [新增] 计算谱微分矩阵 D (用于计算导数)
-            D_mat = obj.computeDifferentiationMatrix(gll_nodes);
+            D_mat = obj.computeDifferentiationMatrix(gll_nodes); % 用于导数计算
             
             ctx.Spectral.Nodes = gll_nodes; 
             ctx.Spectral.Weights = gll_weights;
             ctx.Spectral.Q = Q_mat; 
-            ctx.Spectral.D = D_mat; % 存入 Context
+            ctx.Spectral.D = D_mat;
             ctx.Spectral.NumNodes = length(gll_nodes); 
             
-            NumPlotPoints = 20;
-            tau_plot = linspace(-1, 1, NumPlotPoints)';
-            
-            % --- 3. 组装不变矩阵 ---
+            % 组装不变矩阵
             fprintf('   [Init] Assembling invariant matrices...\n');
             M_sigma_local = obj.Assembler.assembleMassWeighted(space_A, sigmaMap);
             [mi, mj, mv] = find(M_sigma_local);
@@ -87,100 +83,93 @@ classdef SISDCC1Solver < handle
             ctx.W_vec = sparse(ctx.numTotalDofs, 1);
             ctx.W_vec(1:length(W_fem)) = W_fem;
             
-            dt_init = timeSteps(1); 
-            ctx.CircuitRowScale = obj.calculateCircuitScale(ctx, dt_init);
-            
             if islogical(fixedDofs_A), idx_A = find(fixedDofs_A); else, idx_A = fixedDofs_A(:); end
             if islogical(fixedDofs_P), idx_P = find(fixedDofs_P); else, idx_P = fixedDofs_P(:); end
             ctx.fixedDofs = [idx_A; idx_P];
             ctx.fixedDofs = ctx.fixedDofs(ctx.fixedDofs < ctx.numTotalDofs);
             
+            % 初始状态
             x_start = zeros(ctx.numTotalDofs, 1);
-            if nargin >= 11 && ~isempty(init_State)
+            if nargin >= 12 && ~isempty(init_State)
                 n = min(length(init_State), ctx.numTotalDofs);
                 x_start(1:n) = init_State(1:n);
             end
             
-            globalTime = 0;
+            % 数据收集容器
+            full_time_list = []; 
+            full_current_list = []; 
+            full_B_list = [];
             
-            % [新增] 上一时间步终点的物理导数 (用于 C1 预测)
-            u_dot_prev = zeros(ctx.numTotalDofs, 1);
+            % 运行状态变量
+            current_time = 0;
+            slab_count = 0;
+            u_dot_prev = zeros(ctx.numTotalDofs, 1); % 上一步的导数(用于预测)
             
             % ==================================================
-            % 主时间循环
+            % 主时间循环 (Adaptive Loop)
             % ==================================================
-            for slab_idx = 1:length(timeSteps)
-                dt_slab = timeSteps(slab_idx);
-                t_start = globalTime;
-                t_end = t_start + dt_slab;
+            while current_time < t_max - 1e-9
+                slab_count = slab_count + 1;
                 
-                fprintf('\n=== Slab %d/%d (dt=%.1e, T=%.4f -> %.4f) ===\n', ...
-                    slab_idx, length(timeSteps), dt_slab, t_start, t_end);
+                % 1. 确定试探性步长 (Trial Step)
+                % 默认尝试走完预设步长，或者直到仿真结束
+                dt_try = min(dt_preset, t_max - current_time);
                 
-                ctx.dt_slab = dt_slab;
-                ctx.t_start = t_start;
+                % [核心逻辑] 探测阶段 (Probe Phase)
+                fprintf('\n--- Slab %d Probe (Start t=%.4f, Try dt=%.1e) ---\n', slab_count, current_time, dt_try);
                 
-                % --- [改进] 1. C1 Continuous Initialization ---
-                if slab_idx == 1
-                    % 第一步无法利用历史导数，使用常数预测
-                    X_slab = repmat(x_start, 1, ctx.Spectral.NumNodes);
+                % 执行快速探测 (仅 1 次 Sweep)
+                [~, has_inflection, t_split] = obj.probeForInflection(x_start, u_dot_prev, dt_try, current_time, ctx);
+                
+                % 2. 决策阶段 (Decision Phase)
+                if has_inflection && t_split > current_time + obj.MinStepSize && t_split < current_time + dt_try - obj.MinStepSize
+                    % >> 发现拐点，执行分割 <<
+                    dt_final = t_split - current_time;
+                    fprintf('   [ALIGN] Inflection detected at t=%.5f. Splitting step (dt=%.2e).\n', t_split, dt_final);
                 else
-                    % 后续步：利用 u_dot_prev 进行线性外推
-                    % t_local 在 [0, dt_slab] 之间
-                    t_local_nodes = (ctx.Spectral.Nodes + 1) / 2 * dt_slab; 
-                    
-                    % Prediction: x(t) = x_0 + v_0 * t
-                    % x_start: [Dofs x 1], u_dot_prev: [Dofs x 1], t_local: [Nodes x 1]
-                    % Result: [Dofs x Nodes]
-                    X_slab = x_start + u_dot_prev * t_local_nodes';
-                    
-                    % fprintf('   [Predictor] Applied C1 extrapolation.\n');
+                    % >> 无明显拐点，接受试探步长 <<
+                    dt_final = dt_try;
+                    fprintf('   [ACCEPT] Smooth waveform. Proceeding with full step.\n');
                 end
                 
-                % --- 2. SDC Sweep ---
+                % 3. 精细求解 (Refine Solve)
+                % 使用确定的 dt_final 进行计算直到收敛
+                ctx.dt_slab = dt_final;
+                ctx.t_start = current_time;
+                ctx.CircuitRowScale = obj.calculateCircuitScale(ctx, dt_final);
+                
+                % 初始猜测 (C1 Predictor)
+                if current_time == 0
+                     X_slab = repmat(x_start, 1, ctx.Spectral.NumNodes);
+                else
+                     % 线性外推: x = x0 + v*t
+                     t_local = (ctx.Spectral.Nodes + 1)/2 * dt_final;
+                     X_slab = x_start + u_dot_prev * t_local';
+                end
+                
+                % SDC 迭代
+                converged = false;
                 for sdc_iter = 1:obj.MaxSDCIters
                     X_old = X_slab;
-                    [X_slab, max_diff_norm, residual_norm] = obj.performSISDCSweep(X_old, x_start, ctx);
+                    [X_slab, max_diff, ~] = obj.performISDCSweep(X_old, x_start, ctx);
                     
-                    if max_diff_norm < 1e-4
-                        fprintf('   Iter %d: Update=%.2e, Res=%.2e', sdc_iter, max_diff_norm, residual_norm);
-                    else
-                        fprintf('   Iter %d: Update=%.4f, Res=%.4f', sdc_iter, max_diff_norm, residual_norm);
-                    end
-                    
-                    if max_diff_norm < obj.SDCTolerance
-                        fprintf(' -> Converged.\n');
+                    if max_diff < obj.SDCTolerance
+                        fprintf('   -> Converged at Iter %d (Update=%.2e).\n', sdc_iter, max_diff);
+                        converged = true;
                         break;
-                    else
-                        fprintf('\n');
                     end
                 end
                 
-                % --- 3. 计算末端导数 (为下一步做准备) ---
-                % --- 修改为：鲁棒的有限差分导数 (Robust Finite Difference) ---
-                % 利用上一 Slab 最后两个点 (u_N 和 u_{N-1}) 计算斜率
-                % 这种方法对高频数值噪声不敏感，预测更保守、更安全。
+                if ~converged
+                    fprintf('   [WARN] Step did not fully converge (Update=%.2e).\n', max_diff);
+                end
                 
-                % 1. 获取倒数两个节点的解
-                u_final = X_slab(:, end);
-                u_penultimate = X_slab(:, end-1);
+                % 4. 后处理与数据收集
+                % 计算物理时间节点
+                t_nodes_phys = current_time + (ctx.Spectral.Nodes + 1)/2 * dt_final;
                 
-                % 2. 获取倒数两个节点对应的物理时间
-                t_nodes_phys = (ctx.Spectral.Nodes + 1)/2 * dt_slab;
-                dt_last_segment = t_nodes_phys(end) - t_nodes_phys(end-1);
-                
-                % 3. 计算有限差分斜率
-                u_dot_prev = (u_final - u_penultimate) / dt_last_segment;
-                
-                % [可选] 4. 增加阻尼限制 (Damping/Limiter)
-                % 如果预测导致 B 场变化太剧烈，可能会发散。
-                % 简单的工程技巧：稍微衰减导数 (例如 0.8 倍)，让预测值 "Under-shoot" 而不是 "Over-shoot"
-                u_dot_prev = u_dot_prev * 0.8;
-                
-                % --- [Data Collection] ---
-                t_plot_phys = t_start + (tau_plot + 1) / 2 * dt_slab;
+                % 提取物理量
                 I_nodes = X_slab(end, :)';
-                I_plot = obj.interpolatePolynomial(ctx.Spectral.Nodes, I_nodes, tau_plot);
                 
                 B_nodes = zeros(ctx.Spectral.NumNodes, 1);
                 if ~isempty(postProc)
@@ -189,48 +178,119 @@ classdef SISDCC1Solver < handle
                         B_nodes(k) = norm(B_val);
                     end
                 end
-                B_plot = obj.interpolatePolynomial(ctx.Spectral.Nodes, B_nodes, tau_plot);
                 
-                idx_start = 1; if slab_idx > 1, idx_start = 2; end
-                full_time_list = [full_time_list; t_plot_phys(idx_start:end)];
-                full_current_list = [full_current_list; I_plot(idx_start:end)];
-                full_B_list = [full_B_list; B_plot(idx_start:end)];
-                
-                % Update State
-                x_start = X_slab(:, end); 
-                globalTime = t_end;
-                currentHistory(slab_idx) = x_start(end);
-                if ~isempty(postProc), probeB_History(slab_idx) = B_nodes(end); end
-                
-                if ~isempty(postProc)
-                    fprintf('      [End] |B|=%.4f T, I=%.4f A\n', B_nodes(end), full_current_list(end));
+                % 存入全量列表 (用于 Visual Reconstruction)
+                % 避免重复存储连接点
+                if isempty(full_time_list)
+                    full_time_list = t_nodes_phys;
+                    full_current_list = I_nodes;
+                    full_B_list = B_nodes;
+                else
+                    full_time_list = [full_time_list; t_nodes_phys(2:end)];
+                    full_current_list = [full_current_list; I_nodes(2:end)];
+                    full_B_list = [full_B_list; B_nodes(2:end)];
                 end
                 
+                % 计算末端导数 (Robust Finite Difference)
+                % 这种方法比谱导数更稳定，避免过冲
+                u_dot_prev = (X_slab(:, end) - X_slab(:, end-1)) / (t_nodes_phys(end) - t_nodes_phys(end-1));
+                
+                % 更新状态
+                x_start = X_slab(:, end);
+                current_time = current_time + dt_final;
+                
+                % 5. 实时绘图 (使用 PCHIP 平滑重建)
                 if ~isempty(monitorHandle)
-                    try, monitorHandle(globalTime, x_start(end), full_time_list, full_current_list); drawnow limitrate; catch; end
+                   try
+                       % 生成用于画图的密集网格
+                       t_plot = linspace(full_time_list(1), full_time_list(end), length(full_time_list)*3);
+                       I_plot = pchip(full_time_list, full_current_list, t_plot);
+                       monitorHandle(current_time, x_start(end), t_plot, I_plot); 
+                       drawnow limitrate; 
+                   catch; end
                 end
             end
             
+            % 返回结果
             solutionResults = x_start;
-            info.FinalTime = globalTime;
-            info.CurrentHistory = currentHistory;
-            if ~isempty(postProc), info.ProbeB_History = probeB_History; end
-            info.Time_Full = full_time_list;
-            info.Current_Full = full_current_list;
-            info.ProbeB_Full = full_B_list;
+            info.FinalTime = current_time;
+            
+            % 进行最终的 C1 平滑插值用于输出
+            t_out_grid = linspace(0, t_max, 1000)'; % 默认输出 1000 个点
+            % 只有当数据点足够时才插值
+            if length(full_time_list) > 2
+                info.Time_Full = t_out_grid;
+                info.Current_Full = pchip(full_time_list, full_current_list, t_out_grid);
+                info.ProbeB_Full = pchip(full_time_list, full_B_list, t_out_grid);
+            else
+                info.Time_Full = full_time_list;
+                info.Current_Full = full_current_list;
+                info.ProbeB_Full = full_B_list;
+            end
         end
     end
     
     methods (Access = private)
         
+        function [X_probe, found, t_split] = probeForInflection(obj, x_start, u_dot_prev, dt_try, t_start, ctx)
+            % PROBEFORINFLECTION 快速探测波形并查找拐点
+            
+            % 1. 设置上下文
+            ctx.dt_slab = dt_try;
+            ctx.t_start = t_start;
+            % 重新计算 Scale，因为 dt 变了
+            ctx.CircuitRowScale = obj.calculateCircuitScale(ctx, dt_try);
+            
+            % 2. 构造初始猜测 (Predictor)
+            if t_start == 0
+                X_guess = repmat(x_start, 1, ctx.Spectral.NumNodes);
+            else
+                t_local = (ctx.Spectral.Nodes + 1)/2 * dt_try;
+                X_guess = x_start + u_dot_prev * t_local';
+            end
+            
+            % 3. 执行单次扫描 (One Sweep Cost)
+            % 仅迭代一次，用最小成本获取波形趋势
+            [X_probe, ~, ~] = obj.performISDCSweep(X_guess, x_start, ctx);
+            
+            % 4. 分析波形 (Analyze)
+            I_probe = X_probe(end, :); % 获取电流向量 [1 x Nodes]
+            
+            % 计算二阶导数 (Curvature)
+            % dI/dtau = I * D'
+            dI_dtau = I_probe * ctx.Spectral.D';
+            d2I_dtau2 = dI_dtau * ctx.Spectral.D';
+            
+            % 转换回物理时间曲率: d2I/dt2 = d2I/dtau2 * (2/dt)^2
+            curvature = abs(d2I_dtau2 * (2/dt_try)^2);
+            
+            % 寻找最大曲率点
+            % 忽略首尾节点（边界处导数计算通常最不稳定）
+            nodes_range = 2:length(curvature)-1;
+            if isempty(nodes_range)
+                 max_k = 0;
+            else
+                [max_k, idx_local] = max(curvature(nodes_range)); 
+                real_idx = nodes_range(idx_local);
+            end
+            
+            % 5. 判断逻辑
+            found = false;
+            t_split = -1;
+            
+            if max_k > obj.CurvatureThreshold
+                found = true;
+                % 计算拐点物理时间
+                tau_split = ctx.Spectral.Nodes(real_idx);
+                t_split = t_start + (tau_split + 1)/2 * dt_try;
+            end
+        end
+        
         function D = computeDifferentiationMatrix(~, nodes)
             % COMPUTEDIFFERENTIATIONMATRIX 计算 GLL 节点的谱微分矩阵 D
-            % D_ij = dL_j(x_i) / dx
-            
             N = length(nodes) - 1;
             D = zeros(N+1, N+1);
             
-            % 获取每个节点处的 Legendre 多项式值 L_N(x)
             L_vals = zeros(N+1, 1);
             for i = 1:N+1
                 [L_vals(i), ~] = SpectralTimeUtils.legendre_poly(nodes(i), N);
@@ -239,13 +299,11 @@ classdef SISDCC1Solver < handle
             for i = 1:N+1
                 for j = 1:N+1
                     if i ~= j
-                        % 非对角元公式
                         D(i, j) = (L_vals(i) / L_vals(j)) / (nodes(i) - nodes(j));
                     else
-                        % 对角元公式
-                        if i == 1 % x = -1
+                        if i == 1 
                             D(i, j) = -0.25 * N * (N + 1);
-                        elseif i == N+1 % x = 1
+                        elseif i == N+1 
                             D(i, j) = 0.25 * N * (N + 1);
                         else
                             D(i, j) = 0.0;
@@ -255,7 +313,9 @@ classdef SISDCC1Solver < handle
             end
         end
         
-        function [X_new, max_diff_norm, final_res_norm] = performSISDCSweep(obj, X_k, x0, ctx)
+        % --- 复用核心 ISDC 逻辑 (源自 ISDCSolver) ---
+        
+        function [X_new, max_diff_norm, final_res_norm] = performISDCSweep(obj, X_k, x0, ctx)
             num_nodes = ctx.Spectral.NumNodes;
             dt_slab = ctx.dt_slab;
             Q = ctx.Spectral.Q;
@@ -299,15 +359,13 @@ classdef SISDCC1Solver < handle
                     u_guess = X_k(:, m);
                 end
                 
-                [u_next, res_norm, iter_count] = obj.solveImplicitStep(u_guess, dt_sub, RHS_Vector, nodes(m), ctx);
+                [u_next, res_norm, ~] = obj.solveImplicitStep(u_guess, dt_sub, RHS_Vector, nodes(m), ctx);
                 
                 X_new(:, m) = u_next;
                 
                 diff = norm(u_next - X_k(:, m)) / (norm(u_next) + 1e-6);
                 max_diff_norm = max(max_diff_norm, diff);
                 final_res_norm = max(final_res_norm, res_norm);
-                
-                fprintf('        -> Node %d Solved: %d Iters, Res=%.2e\n', m, iter_count, res_norm);
             end
         end
         
@@ -390,7 +448,6 @@ classdef SISDCC1Solver < handle
                 
                 if rel_err < REL_TOL
                     final_res = res_norm;
-                    fprintf('          Newton Converged: RelErr=%.2e\n', rel_err);
                     break;
                 end
                 
@@ -426,10 +483,6 @@ classdef SISDCC1Solver < handle
             end
             
             u_new = u_curr;
-            
-            if final_res / res_norm_init > 1e-1 && final_res > 1.0
-                fprintf('          [Warn] Local Newton stalled at high residual: Rel=%.2e\n', final_res / res_norm_init);
-            end
         end
         
         function scaleFactor = calculateCircuitScale(obj, ctx, dt)
@@ -439,9 +492,7 @@ classdef SISDCC1Solver < handle
             num_fem = size(K_hard, 1);
             hard_vals = abs(diag(K_hard)) + abs(diag_M(1:num_fem)) / dt;
             k_hard_median = full(median(hard_vals(hard_vals > 1e-12)));
-            
             k_soft_rep = k_hard_median / 1000; 
-            
             k_target = sqrt(k_hard_median * k_soft_rep);
             Z_cir = abs(ctx.circuit.R + ctx.circuit.L/dt); 
             max_W = max(abs(nonzeros(ctx.W_vec)));         

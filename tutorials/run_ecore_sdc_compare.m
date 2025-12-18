@@ -113,13 +113,13 @@ timeSteps_bdf = repmat(dt_bdf, round(timeSim/dt_bdf), 1);
 fprintf('\n[Run 2] High-Order SDC Solver (Coarse Step)...\n');
 
 % SDC 策略: 
-dt_slab = 6.6e-3;
+dt_slab = 4.5e-3;
 % timeSteps_sdc = repmat(dt_slab, round(timeSim/dt_slab), 1);
-% timeSteps_sdc = [dt_slab,timeSim-dt_slab];
-timeSteps_sdc = [4.5e-3,4.5e-3,timeSim-9e-3];
+timeSteps_sdc = [dt_slab,timeSim-dt_slab];
+% timeSteps_sdc = [4.5e-3,4.5e-3,timeSim-9e-3];
 
-solver_sdc = LUSDCSolver(assembler);
-solver_sdc.PolyOrder = 3;       % 多项式阶数 P=3 (4个节点)
+solver_sdc = SDIRK2ISDCSolver(assembler);
+solver_sdc.PolyOrder = 4;       % 多项式阶数 P=3 (4个节点)
 solver_sdc.MaxSDCIters = 10;    % SDC 最大修正次数
 solver_sdc.SDCTolerance = 1e-3; % SDC 收敛容差 (相对/绝对混合判据)
 
@@ -130,58 +130,58 @@ tic;
 time_sdc = toc;
 fprintf('-> SDC Completed in %.2f seconds.\n', time_sdc);
 
-% %% --- 4. 结果对比绘图 ---
-% fprintf('\n[Post] Plotting comparison...\n');
-% 
-% % BDF1 (Reference)
+%% --- 4. 结果对比绘图 ---
+fprintf('\n[Post] Plotting comparison...\n');
+
+% BDF1 (Reference)
 % t_bdf = cumsum(timeSteps_bdf);
 % I_bdf = info_bdf.CurrentHistory;
 % B_bdf = info_bdf.ProbeB_History;
-% 
-% % SDC (High-Res Interpolated)
-% t_sdc_full = info_sdc.Time_Full;
-% I_sdc_full = info_sdc.Current_Full;
-% B_sdc_full = info_sdc.ProbeB_Full;
-% 
-% figure('Name', 'BDF1 vs SDC Comparison', 'Position', [200, 200, 1000, 600]);
-% 
-% % 子图 1: 电流对比
-% subplot(2, 1, 1);
-% % 绘制 BDF1 参考线
+
+% SDC (High-Res Interpolated)
+t_sdc_full = info_sdc.Time_Full;
+I_sdc_full = info_sdc.Current_Full;
+B_sdc_full = info_sdc.ProbeB_Full;
+
+figure('Name', 'BDF1 vs SDC Comparison', 'Position', [200, 200, 1000, 600]);
+
+% 子图 1: 电流对比
+subplot(2, 1, 1);
+% 绘制 BDF1 参考线
 % plot(t_bdf*1e3, I_bdf, 'k-', 'LineWidth', 1.5, 'DisplayName', 'BDF1 (Ref)');
-% hold on;
-% % 绘制 SDC 全波形 (插值后的光滑曲线)
-% plot(t_sdc_full*1e3, I_sdc_full, 'r-', 'LineWidth', 1.5, ...
-%     'DisplayName', sprintf('SDC (P=%d, Polynomial Fit)', solver_sdc.PolyOrder));
-% 
-% % 标记真实的 GLL 计算节点，展示 SDC 是如何"以少胜多"的
-% t_sdc_ends = cumsum(timeSteps_sdc);
-% I_sdc_ends = info_sdc.CurrentHistory;
-% plot(t_sdc_ends*1e3, I_sdc_ends, 'ro', 'MarkerFaceColor', 'w', 'MarkerSize', 6, ...
-%     'DisplayName', 'SDC Slab Endpoints');
-% 
-% grid on;
-% xlim([0,timeSim*1e3]);
+hold on;
+% 绘制 SDC 全波形 (插值后的光滑曲线)
+plot(t_sdc_full*1e3, I_sdc_full, 'r-', 'LineWidth', 1.5, ...
+    'DisplayName', sprintf('SDC (P=%d, Polynomial Fit)', solver_sdc.PolyOrder));
+
+% 标记真实的 GLL 计算节点，展示 SDC 是如何"以少胜多"的
+t_sdc_ends = cumsum(timeSteps_sdc);
+I_sdc_ends = info_sdc.CurrentHistory;
+plot(t_sdc_ends*1e3, I_sdc_ends, 'ro', 'MarkerFaceColor', 'w', 'MarkerSize', 6, ...
+    'DisplayName', 'SDC Slab Endpoints');
+
+grid on;
+xlim([0,timeSim*1e3]);
 % legend('Location', 'best');
-% xlabel('Time (ms)'); ylabel('Current (A)');
-% title(sprintf('Inrush Current: Dense BDF1 vs Coarse SDC (dt=%.1fms)', dt_slab*1e3));
-% 
-% % 子图 2: 磁密对比
-% subplot(2, 1, 2);
+xlabel('Time (ms)'); ylabel('Current (A)');
+title(sprintf('Inrush Current: Dense BDF1 vs Coarse SDC (dt=%.1fms)', dt_slab*1e3));
+
+% 子图 2: 磁密对比
+subplot(2, 1, 2);
 % plot(t_bdf*1e3, B_bdf, 'k-', 'LineWidth', 1.5, 'DisplayName', 'BDF1');
-% hold on;
-% plot(t_sdc_full*1e3, B_sdc_full, 'b-', 'LineWidth', 1.5, 'DisplayName', 'SDC (Smooth)');
-% grid on;
-% xlim([0,timeSim*1e3]);
+hold on;
+plot(t_sdc_full*1e3, B_sdc_full, 'b-', 'LineWidth', 1.5, 'DisplayName', 'SDC (Smooth)');
+grid on;
+xlim([0,timeSim*1e3]);
 % legend('Location', 'best');
-% xlabel('Time (ms)'); ylabel('|B| at Origin (T)');
-% title('B-Field at Core Center');
-% 
-% % 误差分析
+xlabel('Time (ms)'); ylabel('|B| at Origin (T)');
+title('B-Field at Core Center');
+
+% 误差分析
 % I_bdf_interp = interp1([0; t_bdf], [0; I_bdf], t_sdc_full, 'linear', 'extrap');
 % rel_err_norm = norm(I_sdc_full - I_bdf_interp) / norm(I_bdf_interp);
-% 
+
 % fprintf('\n--- Accuracy Report ---\n');
 % fprintf('Relative Error (Curve Match): %.2e%%\n', rel_err_norm * 100);
-% 
-% fprintf('\nDone.\n');
+
+fprintf('\nDone.\n');
