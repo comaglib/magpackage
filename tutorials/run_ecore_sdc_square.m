@@ -4,7 +4,7 @@
 % 对比对象：
 %   1. 标准 BDF2 求解器 (TransientCoupledSolver) - 作为基准 (Reference)
 %   2. 高阶 SDC 求解器 (SDCSolver)               - 待验证的高阶算法
-%
+% 
 % 测试目标：
 %   验证 SDC 算法在粗时间步长下，能否达到与细步长 BDF2 相当甚至更高的精度，
 %   特别是针对变压器涌流这种强非线性刚性问题。
@@ -82,8 +82,14 @@ winding.setDirectionField(dir_map);
 circuit = struct();
 circuit.R = 7;  % 电阻 (Ohm)
 circuit.L = 0;  % 漏电感 (H)
-% 电压源: 1500V, 50Hz 正弦波
-circuit.V_source_func = @(t) 1500 * sin(2 * pi * 50 * t);
+
+% 电压源: 矩形波
+freq = 0.5;             % 信号频率
+levels = [0, 100];      % 电压范围
+duty = 40;              % 占空比
+tr = 0.2;               % 上升时间
+tf = 0.2;               % 下降时间
+circuit.V_source_func = @(t) smooth_square_wave(t, freq, levels, duty, tr, tf);
 
 % 1.7 边界条件与组装器
 fixedDofs_A = BoundaryCondition.findOuterBoundaryDofs(mesh, dofHandler, space_A);
@@ -93,16 +99,40 @@ assembler = Assembler(mesh, dofHandler);
 % 探针位置 (铁芯中心)
 probePoint = [0, 0, 0]; 
 
-%% --- 2. 运行 SDC (High-Order) ---
+% %% --- 2. 运行 BDF2 (Reference) ---
+% fprintf('\n[Run 1] Standard BDF2 Solver (Fine Step)...\n');
+% 
+% dt_bdf = 1e-2;     % 细步长
+% timeSim = 1.4;     % 仿真时长
+% timeSteps_bdf = repmat(dt_bdf, round(timeSim/dt_bdf), 1);
+% 
+% tic;
+% solver_bdf = TransientBDF2Solver(assembler);
+% solver_bdf.Tolerance = 1e-3; % BDF2 收敛容差
+% plotFunc = @(t, I, t_vec, I_vec, B_curr, B_hist) monitor_callback(t, I, t_vec, I_vec, B_curr, B_hist);
+% [~, info_bdf] = solver_bdf.solve(space_A, space_P, matLib, sigmaMap, ...
+%                                  circuit, winding, timeSteps_bdf, ...
+%                                  fixedDofs_A, fixedDofs_P, [], plotFunc, probePoint);
+% time_bdf = toc;
+% fprintf('-> BDF2 Completed in %.2f seconds.\n', time_bdf);
+
+%% --- 3. 运行 SDC (High-Order) ---
 fprintf('\n[Run 2] High-Order SDC Solver (Coarse Step)...\n');
 
 % SDC 策略: 
-timeSim = 0.013;     % 仿真时长
-dt_slab = 3.5e-3;    % 4.5e-3; 3.5e-3;
-timeSteps_sdc = [dt_slab,timeSim-dt_slab];
+dt_bdf = 1e-2;     % 细步长
+timeSim = 1.4;     % 仿真时长
+timeSteps_sdc = [0.1-0
+                 0.2-0.1
+                 0.3-0.2
+                 0.75-0.3
+                 0.85-0.75
+                 0.95-0.85
+                 1.1-0.95
+                 1.4-1.1];
 
 solver_sdc = AcISDCSolver(assembler);
-solver_sdc.PolyOrder = 4;       % 多项式阶数 P=4 (5个节点)
+solver_sdc.PolyOrder = 3;       % 多项式阶数 P=4 (5个节点)
 solver_sdc.MaxSDCIters = 10;    % SDC 最大修正次数
 solver_sdc.SDCTolerance = 1e-3; % SDC 收敛容差 (相对/绝对混合判据)
 
@@ -113,28 +143,13 @@ tic;
 time_sdc = toc;
 fprintf('-> SDC Completed in %.2f seconds.\n', time_sdc);
 
-%% --- 3. 运行 BDF2 (Reference) ---
-fprintf('\n[Run 1] Standard BDF2 Solver (Fine Step)...\n');
-
-dt_bdf = 5e-4;            % 细步长
-timeSteps_bdf = repmat(dt_bdf, round(timeSim/dt_bdf), 1);
-
-% tic;
-solver_bdf = TransientBDF2Solver(assembler);
-solver_bdf.Tolerance = 1e-3; % BDF2 收敛容差
-[~, info_bdf] = solver_bdf.solve(space_A, space_P, matLib, sigmaMap, ...
-                                 circuit, winding, timeSteps_bdf, ...
-                                 fixedDofs_A, fixedDofs_P, [], [], probePoint);
-time_bdf = toc;
-fprintf('-> BDF2 Completed in %.2f seconds.\n', time_bdf);
-
 %% --- 4. 结果对比绘图 ---
 fprintf('\n[Post] Plotting comparison...\n');
 
 % BDF2 (Reference)
-t_bdf = cumsum(timeSteps_bdf);
-I_bdf = info_bdf.CurrentHistory;
-B_bdf = info_bdf.ProbeB_History;
+% t_bdf = cumsum(timeSteps_bdf);
+% I_bdf = info_bdf.CurrentHistory;
+% B_bdf = info_bdf.ProbeB_History;
 
 % SDC (High-Res Interpolated)
 t_sdc_full = info_sdc.Time_Full;
@@ -146,7 +161,7 @@ figure('Name', 'BDF2 vs SDC Comparison', 'Position', [200, 200, 1000, 600]);
 % 子图 1: 电流对比
 subplot(2, 1, 1);
 % 绘制 BDF2 参考线
-plot(t_bdf*1e3, I_bdf, 'k-', 'LineWidth', 1.5, 'DisplayName', 'BDF2 (Ref)');
+% plot(t_bdf*1e3, I_bdf, 'k-', 'LineWidth', 1.5, 'DisplayName', 'BDF2 (Ref)');
 hold on;
 % 绘制 SDC 全波形 (插值后的光滑曲线)
 plot(t_sdc_full*1e3, I_sdc_full, 'r-', 'LineWidth', 1.5, ...
@@ -160,26 +175,62 @@ plot(t_sdc_full*1e3, I_sdc_full, 'r-', 'LineWidth', 1.5, ...
 
 grid on;
 xlim([0,timeSim*1e3]);
-legend('Location', 'best');
+% legend('Location', 'best');
 xlabel('Time (ms)'); ylabel('Current (A)');
-title(sprintf('Inrush Current: Dense BDF2 vs Coarse SDC (dt=%.1fms)', dt_slab*1e3));
+title(sprintf('Inrush Current: Dense BDF2 vs Coarse SDC'));
 
 % 子图 2: 磁密对比
 subplot(2, 1, 2);
-plot(t_bdf*1e3, B_bdf, 'k-', 'LineWidth', 1.5, 'DisplayName', 'BDF2');
+% plot(t_bdf*1e3, B_bdf, 'k-', 'LineWidth', 1.5, 'DisplayName', 'BDF2');
 hold on;
 plot(t_sdc_full*1e3, B_sdc_full, 'b-', 'LineWidth', 1.5, 'DisplayName', 'SDC (Smooth)');
 grid on;
 xlim([0,timeSim*1e3]);
-legend('Location', 'best');
+% legend('Location', 'best');
 xlabel('Time (ms)'); ylabel('|B| at Origin (T)');
 title('B-Field at Core Center');
 
 % 误差分析
-I_bdf_interp = interp1([0; t_bdf], [0; I_bdf], t_sdc_full, 'linear', 'extrap');
-rel_err_norm = norm(I_sdc_full - I_bdf_interp) / norm(I_bdf_interp);
-
-fprintf('\n--- Accuracy Report ---\n');
-fprintf('Relative Error (Curve Match): %.2e%%\n', rel_err_norm * 100);
+% I_bdf_interp = interp1([0; t_bdf], [0; I_bdf], t_sdc_full, 'linear', 'extrap');
+% rel_err_norm = norm(I_sdc_full - I_bdf_interp) / norm(I_bdf_interp);
+% 
+% fprintf('\n--- Accuracy Report ---\n');
+% fprintf('Relative Error (Curve Match): %.2e%%\n', rel_err_norm * 100);
 
 fprintf('\nDone.\n');
+
+
+%% --- 辅助局部函数 (请将此函数放在脚本的最末尾) ---
+function monitor_callback(t, I, t_vec, I_vec, B_curr, B_hist)
+    % 创建或激活图形窗口
+    persistent hFig;
+    if isempty(hFig) || ~isvalid(hFig)
+        hFig = figure('Name', 'Real-time Monitor', 'Position', [100, 100, 800, 600]);
+    end
+    set(0, 'CurrentFigure', hFig);
+
+    % --- 子图 1: 电流波形 ---
+    subplot(2, 1, 1);
+    plot(t_vec, I_vec, 'r-o', 'LineWidth', 1.5, 'MarkerSize', 4);
+    grid on;
+    ylabel('Current (A)', 'FontSize', 10);
+    title(sprintf('Time: %.4f s | Current: %.4f A', t, I), 'FontSize', 11);
+    xlim([0, max(t_vec(end), 1e-6)]); % 动态调整轴范围
+    
+    % --- 子图 2: 磁密波形 ---
+    subplot(2, 1, 2);
+    if isempty(B_hist)
+        % 兼容性处理: 如果尚未生成 B 数据 (第一步)
+        B_plot = 0; t_plot = 0;
+    else
+        B_plot = B_hist; t_plot = t_vec;
+    end
+    plot(t_plot, B_plot, 'b-d', 'LineWidth', 1.5, 'MarkerSize', 4);
+    grid on;
+    ylabel('|B| Magnitude (T)', 'FontSize', 10);
+    xlabel('Time (s)', 'FontSize', 10);
+    title(sprintf('Probe |B|: %.4f T', B_curr), 'FontSize', 11);
+    xlim([0, max(t_vec(end), 1e-6)]);
+    
+    drawnow limitrate; % 限制刷新率以保证计算速度
+end

@@ -8,7 +8,7 @@ classdef AcISDCSolver < handle
     %   1. 基础积分器 (Base Integrator): Backward Euler (一阶后向欧拉)
     %      - 优势: 具有最大的数值阻尼 (L-stable)，能强力抑制高频振荡和 Gibbs 现象。
     %      - 作用: 在每个 SDC 子步中，作为内层求解器，保证非光滑过程的稳定性。
-    %
+    % 
     %   2. 加速技术 (Acceleration): Anderson Acceleration (安德森加速)
     %      - 优势: 将不动点迭代的线性收敛转化为超线性收敛。
     %      - 作用: 利用过去 m 次 Sweep 的历史残差，构建最优线性组合，显著减少 SDC 
