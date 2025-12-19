@@ -238,5 +238,5 @@ function monitor_callback(t, I, t_vec, I_vec, B_curr, B_hist)
     title(sprintf('Probe |B|: %.4f T', B_curr), 'FontSize', 11);
     xlim([0, max(t_vec(end), 1e-6)]);
     
-    drawnow limitrate; % 限制刷新率以保证计算速度
+    drawnow; % 限制刷新率以保证计算速度
 end

@@ -1,20 +1,15 @@
-/**
- * assemble_jacobian_kernel_mex.cpp
- * 功能: 适配 MexElemUtils.hpp 接口 (Mat3x3 & compute_jacobian_3d)
- */
-
 #include "mex.h"
 #include <omp.h>
 #include <cmath>
-#include <vector>
 #include "MexElemUtils.hpp"
 #include "MexMaterialUtils.hpp" 
 
 void mexFunction(int nlhs, mxArray *plhs[], int nrhs, const mxArray *prhs[])
 {
-    // Expected Args: 16 inputs
-    if (nrhs != 16) mexErrMsgIdAndTxt("MagPackage:Args", "Expected 16 inputs.");
+    // [修复点]: 增加到 17 个输入参数
+    if (nrhs != 17) mexErrMsgIdAndTxt("MagPackage:Args", "Expected 17 inputs.");
 
+    // 基础输入
     double* P = mxGetPr(prhs[0]);
     double* T = mxGetPr(prhs[1]);
     double* Dofs = mxGetPr(prhs[2]);
@@ -24,6 +19,7 @@ void mexFunction(int nlhs, mxArray *plhs[], int nrhs, const mxArray *prhs[])
     double* Qw = mxGetPr(prhs[6]);
     double* RefCurl = mxGetPr(prhs[7]);
 
+    // 材质打包数据
     double* M_lin = mxGetPr(prhs[8]);
     double* M_isNon = mxGetPr(prhs[9]);
     double* M_maxB = mxGetPr(prhs[10]);
@@ -31,8 +27,9 @@ void mexFunction(int nlhs, mxArray *plhs[], int nrhs, const mxArray *prhs[])
     double* M_coe = mxGetPr(prhs[12]);
     double* M_start = mxGetPr(prhs[13]);
     double* M_cnt = mxGetPr(prhs[14]);
+    double* M_coe_start = mxGetPr(prhs[15]); // [新增参数]
 
-    bool CalcJ = (bool)mxGetScalar(prhs[15]);
+    bool CalcJ = (bool)mxGetScalar(prhs[16]); // [索引后移]
 
     size_t numElems = mxGetN(prhs[1]);
     size_t n_q = mxGetM(prhs[6]) * mxGetN(prhs[6]);
@@ -45,10 +42,10 @@ void mexFunction(int nlhs, mxArray *plhs[], int nrhs, const mxArray *prhs[])
     matData.coefs = M_coe;
     matData.splineStart = M_start;
     matData.splineCount = M_cnt;
+    matData.splineCoeStart = M_coe_start; // [新增挂载]
 
-    // Outputs
+    // 输出分配
     size_t nnz = CalcJ ? (numElems * 36) : 0;
-    
     plhs[0] = mxCreateDoubleMatrix(nnz, 1, mxREAL); // I
     plhs[1] = mxCreateDoubleMatrix(nnz, 1, mxREAL); // J
     plhs[2] = mxCreateDoubleMatrix(nnz, 1, mxREAL); // V
@@ -63,7 +60,6 @@ void mexFunction(int nlhs, mxArray *plhs[], int nrhs, const mxArray *prhs[])
 
     #pragma omp parallel for schedule(static)
     for (size_t e = 0; e < numElems; e++) {
-        // Fetch Element Nodes
         double nodes[4][3];
         for (int i = 0; i < 4; i++) {
             int nid = (int)T[i + e*4] - 1;
@@ -72,14 +68,11 @@ void mexFunction(int nlhs, mxArray *plhs[], int nrhs, const mxArray *prhs[])
             nodes[i][2] = P[nid*3 + 2];
         }
 
-        // [Modified] Use MexElemUtils interface
         Mat3x3 J_mat;
         double detJ = MexElemUtils::compute_jacobian_3d(&nodes[0][0], J_mat);
-        
         double absDetJ = std::abs(detJ);
         double invDetJ = 1.0 / detJ;
 
-        // Fetch Dofs & Signs
         int dofs[6];
         double signs[6];
         double A_local[6];
@@ -98,18 +91,14 @@ void mexFunction(int nlhs, mxArray *plhs[], int nrhs, const mxArray *prhs[])
 
         for (size_t q = 0; q < n_q; q++) {
             double w = Qw[q] * absDetJ;
-            
             for (int i = 0; i < 6; i++) {
                 double c_ref[3];
                 c_ref[0] = RefCurl[i + 0*6 + q*18];
                 c_ref[1] = RefCurl[i + 1*6 + q*18];
                 c_ref[2] = RefCurl[i + 2*6 + q*18];
 
-                // [Modified] Use Mat3x3::multVec for Piola transform (numerator)
-                // Curl = (1/detJ) * J * Curl_ref
                 double c_phy[3];
                 J_mat.multVec(c_ref, c_phy);
-
                 CurlNi[i][0] = c_phy[0] * invDetJ;
                 CurlNi[i][1] = c_phy[1] * invDetJ;
                 CurlNi[i][2] = c_phy[2] * invDetJ;
@@ -136,7 +125,6 @@ void mexFunction(int nlhs, mxArray *plhs[], int nrhs, const mxArray *prhs[])
                                            CurlNi[i][1]*CurlNi[j][1] + 
                                            CurlNi[i][2]*CurlNi[j][2];
                         double B_dot_Cj = B[0]*CurlNi[j][0] + B[1]*CurlNi[j][1] + B[2]*CurlNi[j][2];
-                        
                         double val = nu * Ci_dot_Cj + 2.0 * dnu * B_dot_Ci * B_dot_Cj;
                         K_local[i][j] += val * w;
                     }
