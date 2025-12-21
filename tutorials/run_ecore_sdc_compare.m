@@ -117,7 +117,7 @@ probePoint = [0, 0, 0];
 %% --- 3. 运行 BDF2 (Reference) ---
 fprintf('\n[Run 1] Standard BDF2 Solver (Fine Step)...\n');
 
-dt_bdf = 1e-4;
+dt_bdf = 1e-3;
 timeSim = 0.02*100;
 timeSteps_bdf = repmat(dt_bdf, round(timeSim/dt_bdf), 1);
 
@@ -201,10 +201,10 @@ function monitor_callback(t, I, t_vec, I_vec, B_curr, B_hist)
         hFig = figure('Name', 'Real-time Monitor', 'Position', [100, 100, 800, 600]);
     end
     set(0, 'CurrentFigure', hFig);
-
+    
     % --- 子图 1: 电流波形 ---
     subplot(2, 1, 1);
-    plot(t_vec, I_vec, 'r-o', 'LineWidth', 1.5, 'MarkerSize', 4);
+    plot(t_vec, I_vec, 'r', 'LineWidth', 1);
     grid on;
     ylabel('Current (A)', 'FontSize', 10);
     title(sprintf('Time: %.4f s | Current: %.4f A', t, I), 'FontSize', 11);
@@ -218,7 +218,7 @@ function monitor_callback(t, I, t_vec, I_vec, B_curr, B_hist)
     else
         B_plot = B_hist; t_plot = t_vec;
     end
-    plot(t_plot, B_plot, 'b-d', 'LineWidth', 1.5, 'MarkerSize', 4);
+    plot(t_plot, B_plot, 'b', 'LineWidth', 1);
     grid on;
     ylabel('|B| Magnitude (T)', 'FontSize', 10);
     xlabel('Time (s)', 'FontSize', 10);
