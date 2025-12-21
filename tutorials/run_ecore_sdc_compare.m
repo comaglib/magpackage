@@ -75,8 +75,8 @@ dofHandler.distributeDofs(space_P);
 [center, radius, area_S, axis_idx] = CoilGeometryUtils.autoDetectCircular(mesh, NEW_TAG_PRIM);
 dir_map = -1.0 * CoilGeometryUtils.computeCircularDirection(mesh, NEW_TAG_PRIM, center, axis_idx);
 
-R = 0.2;
-winding = Winding('Primary', NEW_TAG_PRIM, 3000, R, area_S, [0,0,0]);
+R = 100;
+winding = Winding('Primary', NEW_TAG_PRIM, 300, R, area_S, [0,0,0]);
 winding.setDirectionField(dir_map);
 
 % 1.6 外电路参数
@@ -84,7 +84,7 @@ circuit = struct();
 circuit.R = R;  % 电阻 (Ohm)
 circuit.L = 0;  % 漏电感 (H)
 % 电压源: 1500V, 50Hz 正弦波
-circuit.V_source_func = @(t) 1500 * sin(2 * pi * 50 * t);
+circuit.V_source_func = @(t) 76 * sin(2 * pi * 50 * t);
 
 % 1.7 边界条件与组装器
 fixedDofs_A = BoundaryCondition.findOuterBoundaryDofs(mesh, dofHandler, space_A);
@@ -117,8 +117,8 @@ probePoint = [0, 0, 0];
 %% --- 3. 运行 BDF2 (Reference) ---
 fprintf('\n[Run 1] Standard BDF2 Solver (Fine Step)...\n');
 
-dt_bdf = 1e-3;
-timeSim = 0.02*100;
+dt_bdf = 2e-4;
+timeSim = 0.02*3;
 timeSteps_bdf = repmat(dt_bdf, round(timeSim/dt_bdf), 1);
 
 tic;
