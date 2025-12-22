@@ -36,7 +36,7 @@ classdef BDF2BreakerSolver < TransientBDF2Solver
                                                  probePoint)
             
             fprintf('==================================================\n');
-            fprintf('   Breaker Solver (BDF2) - Exact Energy Physics   \n');
+            fprintf('   Breaker Solver (BDF2) - PostProc Integrated    \n');
             fprintf('==================================================\n');
             
             % -----------------------------------------------------------
@@ -58,65 +58,6 @@ classdef BDF2BreakerSolver < TransientBDF2Solver
             ctx.space_P = space_P;
             ctx.matLib = matLib;
             ctx.circuit = circuitProps;
-            
-            % -----------------------------------------------------------
-            % [适配 MaterialLib v4.0] 预计算能量密度表
-            % -----------------------------------------------------------
-            energy_tables = containers.Map('KeyType', 'double', 'ValueType', 'any');
-            tag_keys = matLib.keys;
-            
-            for i = 1:length(tag_keys)
-                t_id = tag_keys{i};
-                mat = matLib(t_id);
-                
-                if strcmp(mat.Type, 'Nonlinear')
-                    % 既然使用 PCHIP Spline，我们无法直接获取原始点。
-                    % 策略：生成一个高分辨率的 B 向量，从 Spline 反算 H，再积分 W。
-                    
-                    % 1. 确定采样范围
-                    if isfield(mat, 'MaxBSq')
-                        max_B = sqrt(mat.MaxBSq);
-                    else
-                        max_B = 5.0; % 默认保护值
-                    end
-                    
-                    % 2. 生成高密度的采样点 (对数分布以捕捉低场特性)
-                    %    从 0 到 1.2*max_B (稍微过采样以覆盖饱和区)
-                    B_sample = unique([0, logspace(-4, log10(max_B*1.2), 2000)]);
-                    B_sq_sample = B_sample.^2;
-                    
-                    % 3. 从 SplineNu 计算 Nu
-                    %    使用 ppval 评估 PCHIP 样条
-                    if isfield(mat, 'SplineNu')
-                        % 注意处理超出范围的情况(虽然采样受控，但为了健壮性)
-                        % MaterialLib v4.0 处理了外推，这里可以直接调用 ppval
-                        % 但为了最安全，我们调用 MaterialLib.evaluate 静态方法吗？
-                        % 不，MaterialLib.evaluate 需要 B_sq，返回的是 Nu。
-                        % 我们直接用 ppval 更快，因为我们只在 MaxBSq 范围内采样。
-                        Nu_sample = ppval(mat.SplineNu, B_sq_sample);
-                        
-                        % 物理修正: 确保 Nu 不小于真空且不为负 (v4.0 逻辑)
-                        nu0 = 1/(4*pi*1e-7); 
-                        if isfield(mat, 'nu0'), nu0 = mat.nu0; end
-                        Nu_sample(Nu_sample > nu0) = nu0;
-                        Nu_sample(Nu_sample < 1e-6) = nu0; % 防止病态
-                    else
-                        % 兼容旧版或错误数据
-                        error('MaterialLib v4.0 requires SplineNu field.');
-                    end
-                    
-                    % 4. 反算 H = Nu * B
-                    H_sample = Nu_sample .* B_sample;
-                    
-                    % 5. 积分能量密度 W = int(H dB)
-                    W_density_arr = cumtrapz(B_sample, H_sample);
-                    
-                    % 6. 存储结果用于快速插值
-                    tbl.B = B_sample;
-                    tbl.W = W_density_arr;
-                    energy_tables(t_id) = tbl;
-                end
-            end
             
             % 矩阵组装
             fprintf('   [Init] Assembling invariant matrices...\n');
@@ -151,21 +92,16 @@ classdef BDF2BreakerSolver < TransientBDF2Solver
             ctx.x_prev = x_curr; 
             ctx.x_prev2 = x_curr; 
             
-            % 计算 t=0 精确磁能
-            W_mag_prev_exact = 0;
-            if nargin >= 11 && ~isempty(init_State)
-                A_init = x_curr(1:ctx.num_A);
-                W_mag_prev_exact = obj.computeExactEnergy(A_init, matLib, energy_tables);
-            end
-            
             % -----------------------------------------------------------
-            % 2. 监测器初始化
+            % 2. 监测器与后处理对象初始化
             % -----------------------------------------------------------
             I_initial = x_curr(numFemDofs+1 : end); 
-            postProc = [];
+            
+            % 初始化 PostProcessor (复用 Assembler)
+            postProc = PostProcessor(obj.Assembler); 
+            
             B_mag_initial = 0;
             if nargin >= 13 && ~isempty(probePoint)
-                postProc = PostProcessor(obj.Assembler);
                 B0_vec = postProc.probeB(x_curr(1:ctx.num_A), probePoint);
                 B_mag_initial = norm(B0_vec);
             end
@@ -180,6 +116,11 @@ classdef BDF2BreakerSolver < TransientBDF2Solver
                 catch
                 end
             end
+            
+            % 计算 t=0 时刻的精确磁能 (利用 PostProcessor)
+            % 注意: PostProcessor 需要纯 A 场向量
+            A_init = x_curr(1:ctx.num_A);
+            W_mag_prev_exact = postProc.computeMagneticEnergy(A_init, matLib);
             
             % -----------------------------------------------------------
             % 3. 历史记录与能量审计初始化
@@ -272,7 +213,7 @@ classdef BDF2BreakerSolver < TransientBDF2Solver
                     [J_bc, Res_bc] = BoundaryCondition.applyDirichlet(J_sys, Res_vec, ctx.fixedDofs);
                     dx = obj.LinearSolver.solve(J_bc, -Res_bc);
                     
-                    % Line Search (Compatible)
+                    % Line Search
                     alpha = 1.0; 
                     if obj.UseLineSearch
                         for k = 0:obj.MaxLineSearchIters
@@ -295,7 +236,7 @@ classdef BDF2BreakerSolver < TransientBDF2Solver
                 ctx.x_prev2 = ctx.x_prev; 
                 ctx.x_prev = x_curr;
                 
-                % Post-Process
+                % Post-Process Data
                 A_sol = x_curr(1:ctx.num_A);
                 I_step = x_curr(numFemDofs+1 : end);
                 currentHistory(t_idx, :) = I_step(:)';
@@ -306,33 +247,37 @@ classdef BDF2BreakerSolver < TransientBDF2Solver
                 end
                 
                 % =======================================================
-                % Exact Energy Audit (Re-Sampling Strategy)
+                % 精确能量审计 (直接调用 PostProcessor)
                 % =======================================================
-                W_mag_current_exact = obj.computeExactEnergy(A_sol, matLib, energy_tables);
+                
+                % 1. 调用 PostProcessor 计算全场磁能
+                %    (内部会自动处理非线性积分)
+                W_mag_current_exact = postProc.computeMagneticEnergy(A_sol, matLib);
                 
                 if t_idx > 1
-                    % 1. Magnetic Energy Change
+                    % 1.1 磁场储能变化
                     d_W_mag = W_mag_current_exact - W_mag_prev_exact;
                     obj.Hist_W_mag = W_mag_current_exact;
                     
-                    % 2. Ohmic Loss
+                    % 2. 线圈电阻损耗
                     d_E_ohm = sum((I_step.^2) * obj.R_winding_Audit * dt);
                     obj.Hist_E_ohm_cum = obj.Hist_E_ohm_cum + d_E_ohm;
                     
-                    % 3. Eddy Loss
+                    % 3. 涡流损耗 (直接利用质量矩阵计算)
+                    %    P_eddy = (dA/dt)' * M_sigma * (dA/dt)
                     dx_dt = ctx.bdf_alpha * x_curr + ctx.bdf_beta_vec;
                     P_eddy_inst = dx_dt' * ctx.M_sigma * dx_dt;
                     d_E_eddy = P_eddy_inst * dt;
                     obj.Hist_E_eddy_cum = obj.Hist_E_eddy_cum + d_E_eddy;
                     energyLog.P_eddy(t_idx) = P_eddy_inst;
                     
-                    % 4. Source
+                    % 4. 源输入
                     d_E_source = 0;
                     if ~isBreakerOpen
                         d_E_source = sum(V_vals .* I_step * dt); 
                     end
                     
-                    % 5. Numerical Dissipation
+                    % 5. 数值耗散
                     d_E_num = d_E_source - (d_W_mag + d_E_ohm + d_E_eddy);
                     obj.Hist_E_num_cum = obj.Hist_E_num_cum + d_E_num;
                     
@@ -350,7 +295,6 @@ classdef BDF2BreakerSolver < TransientBDF2Solver
                 energyLog.time(t_idx) = currentTime;
                 energyLog.W_mag(t_idx) = obj.Hist_W_mag;
                 
-                % Real-time Plotting
                 if ~isempty(monitorHandle)
                     try
                          t_plt = [0; energyLog.time(1:t_idx)];
@@ -372,66 +316,6 @@ classdef BDF2BreakerSolver < TransientBDF2Solver
             info.EnergyLog = energyLog; 
             
             obj.plotEnergyAudit(energyLog);
-        end
-        
-        function W_total = computeExactEnergy(obj, A_vec, matLib, energy_tables)
-            % COMPUTEXACTENERGY 计算全场精确磁储能 (场积分法)
-            % W = sum( int(H dB) * Volume )
-            
-            W_total = 0;
-            mesh = obj.Assembler.Mesh;
-            
-            % 1. 计算所有单元的 B 场 (中心点近似)
-            %    注意：为了速度，这里使用单元中心 B 值代表全单元
-            %    PostProcessor 中有 computeElementB 方法
-            post = PostProcessor(obj.Assembler);
-            B_elems = post.computeElementB(A_vec, 'Nedelec_P1'); % [3 x nElem]
-            B_mag_elems = sqrt(sum(B_elems.^2, 1)); % [1 x nElem]
-            
-            % 2. 获取所有单元的体积
-            %    Mesh 类通常需要预计算体积，如果没有，这里现场计算(四面体)
-            %    假设 Mesh.Elements 包含节点索引，Mesh.Nodes 包含坐标
-            %    这里简化处理，假设 PostProcessor 或 Mesh 能提供单元体积向量
-            %    如果没有现成属性，可以使用 Assembler.Mesh.ElementVolumes
-            %    (如果没有，请在 Mesh 类中添加计算体积的逻辑，或使用以下简化版)
-            
-            % [临时] 快速计算四面体体积 (如果是线性四面体)
-            % Vol = det([1 x1 y1 z1; ...]) / 6
-            % 为保持代码简洁，这里假设 obj.Assembler.Mesh.CellVolumes 已存在
-            % 如果不存在，你需要在 Mesh 类里加一行: obj.CellVolumes = ...
-            V_elems = mesh.CellVolumes; 
-            
-            region_tags = mesh.RegionTags;
-            
-            % 3. 遍历不同材料区域进行累加
-            uTags = unique(region_tags);
-            for i = 1:length(uTags)
-                tag = uTags(i);
-                mask = (region_tags == tag);
-                
-                % 提取该区域所有单元的 B 和 Vol
-                B_sub = B_mag_elems(mask);
-                V_sub = V_elems(mask);
-                
-                mat = matLib(tag);
-                
-                if strcmp(mat.Type, 'Linear')
-                    % 线性材料: W = 0.5 * B^2 / mu
-                    mu = mat.Nu_Linear; % 注意：这里 MaterialLib 存的是 nu 还是 mu?
-                    % 通常 Nu = 1/mu. 假设存的是相对磁导率 mu_r 或 磁阻率 nu
-                    % 假设是 Nu (磁阻率): Energy Density = 0.5 * Nu * B^2
-                    w_density = 0.5 * mat.Nu_Linear * (B_sub.^2);
-                    
-                elseif strcmp(mat.Type, 'Nonlinear')
-                    % 非线性材料: 查表插值
-                    tbl = energy_tables(tag);
-                    % 使用线性插值查找能量密度
-                    w_density = interp1(tbl.B, tbl.W, B_sub, 'linear', 'extrap');
-                end
-                
-                % 累加能量
-                W_total = W_total + sum(w_density .* V_sub);
-            end
         end
         
         function plotEnergyAudit(~, log)

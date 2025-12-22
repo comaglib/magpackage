@@ -542,7 +542,7 @@ classdef PostProcessor < handle
         end
         
         function Energy = computeMagneticEnergy(obj, A_sol, MatLibData)
-            % COMPUTEMAGNETICENERGY 计算全场磁能
+            % COMPUTEMAGNETICENERGY 计算全场磁能 (支持 Map 和 Array 输入)
             % 
             % 原理:
             %   如果全是线性材料，能量 E = 0.5 * Integral( B * H ) dV
@@ -552,29 +552,57 @@ classdef PostProcessor < handle
             %   如果包含非线性材料 (B-H 曲线)，刚度矩阵 K 不再适用能量计算，
             %   必须使用逐单元数值积分 W = Integral( w_density ) dV。
             
+            % 1. 检查材料库类型并提取 Keys
+            is_map = isa(MatLibData, 'containers.Map');
+            if is_map
+                matKeys = MatLibData.keys;
+                numMats = length(matKeys);
+            else
+                numMats = length(MatLibData);
+            end
+            
+            % 2. 检查是否全线性材料
             all_linear = true;
-            for i = 1:length(MatLibData)
-                if ~strcmp(MatLibData(i).Type, 'Linear')
+            for i = 1:numMats
+                if is_map
+                    mat = MatLibData(matKeys{i});
+                else
+                    mat = MatLibData(i);
+                end
+                
+                if ~strcmp(mat.Type, 'Linear')
                     all_linear = false; break;
                 end
             end
+            
             space = FunctionSpace('Nedelec', 1); 
             
             if all_linear
-                % --- 线性优化分支 ---
-                % 组装临时的线性刚度矩阵
-                NuMap = zeros(length(MatLibData), 1);
-                for i = 1:length(MatLibData)
-                    NuMap(i) = MatLibData(i).Nu_Linear;
+                % --- 线性优化分支 (基于刚度矩阵) ---
+                % 组装 NuMap (支持 Map 或 Vector 格式以匹配 Assembler)
+                if is_map
+                    NuMap = containers.Map('KeyType', 'double', 'ValueType', 'double');
+                    for i = 1:numMats
+                        tag = matKeys{i};
+                        NuMap(tag) = MatLibData(tag).Nu_Linear;
+                    end
+                else
+                    NuMap = zeros(numMats, 1);
+                    for i = 1:numMats
+                        NuMap(i) = MatLibData(i).Nu_Linear;
+                    end
                 end
+                
+                % 组装线性刚度矩阵
                 K = obj.Assembler.assembleStiffness(space, NuMap);
                 % 矩阵乘法快速计算能量
                 Energy = 0.5 * real(A_sol' * K * A_sol);
             else
-                % --- 非线性通用分支 ---
+                % --- 非线性通用分支 (基于单元积分) ---
                 % 准备数据并调用积分核函数
                 packedData = obj.Assembler.preparePackedData(space);
                 packedData.RegionTags = obj.Mesh.RegionTags;
+                % integrate_energy_kernel 内部支持 Map 类型的 MatLibData
                 Energy = obj.integrate_energy_kernel(packedData, A_sol, MatLibData);
             end
         end

@@ -71,6 +71,8 @@ classdef MaterialLib
             [B_curve, sortIdx] = sort(B_curve); H_curve = H_curve(sortIdx);
             [B_unique, uniqueIdx] = unique(B_curve, 'last');
             H_unique = H_curve(uniqueIdx);
+            matData.B_data = B_unique;
+            matData.H_data = H_unique;
             
             % 2. 转换到 Nu - B^2 空间
             B_sq = B_unique.^2;

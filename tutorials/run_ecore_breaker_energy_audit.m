@@ -1,4 +1,4 @@
-% test_breaker_energy_audit.m
+% run_ecore_breaker_energy_audit.m
 % 
 % 描述:
 %   基于 BDF2BreakerSolver 的分闸与能量审计测试脚本。
@@ -106,9 +106,12 @@ solver.LinearSolver.MumpsSymmetry = 0;
 solver.LinearSolver.MumpsICNTL.i14 = 300;
 
 % 4.3 时间步进
-dt = 1e-3;
+dt = 5e-5;
 timeSim = 0.015;    % 总时长
-timeSteps = repmat(dt, round(timeSim/dt), 1);
+% timeSteps = repmat(dt, round(timeSim/dt), 1);
+timeSteps = [repmat(5e-4, round(solver.BreakerTime/(5e-4)), 1);
+             repmat(dt, round((timeSim-solver.BreakerTime)/dt), 1)];
+
 
 % 4.4 边界条件
 fixedDofs_A = BoundaryCondition.findOuterBoundaryDofs(mesh, dofHandler, space_A);

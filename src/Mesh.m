@@ -1,8 +1,9 @@
 classdef Mesh < handle
-    % MESH 有限元网格基础类 (v2.0 - Unit Support)
+    % MESH 有限元网格基础类 (v2.1 - Volume Calculation)
     % 
     % 更新:
     %   1. load 方法现在支持 unit_tag 参数 (例如 'mm')，用于坐标缩放。
+    %   2. [New] 增加 CellVolumes 属性及自动计算逻辑。
     
     properties
         P           % 节点坐标 [3 x N_nodes]
@@ -16,6 +17,9 @@ classdef Mesh < handle
         % 拓扑映射
         T2E         % [6 x N_elems] 单元到棱的映射
         T2E_Sign    % [6 x N_elems] 局部棱与全局棱的方向一致性
+        
+        % [New] 几何属性
+        CellVolumes % [1 x N_elems] 单元体积 (m^3)
         
         NumNodes
         NumElements
@@ -36,7 +40,6 @@ classdef Mesh < handle
             fprintf('[Mesh] Loading %s (Unit: %s) ...\n', filename, unit_tag);
             
             if strcmpi(ext, '.msh')
-                % 注意: read_msh 可能需要更新以支持 unit_tag，这里暂只处理 mphtxt
                 raw = read_msh(filename); 
                 if ~strcmpi(unit_tag, 'm')
                     warning('read_msh 暂不支持自动缩放，请手动确认单位。');
@@ -54,10 +57,60 @@ classdef Mesh < handle
             
             obj.NumNodes = size(obj.P, 2);
             obj.NumElements = size(obj.T, 2);
+            
+            % [New] 加载后立即计算单元体积
+            obj.computeCellVolumes();
         end
     end
     
     methods
+        function computeCellVolumes(obj)
+            % COMPUTECELLVOLUMES 计算所有单元的体积
+            if isempty(obj.P) || isempty(obj.T), return; end
+            
+            fprintf('[Mesh] Computing element volumes...\n');
+            
+            dim = size(obj.P, 1);
+            nodesPerElem = size(obj.T, 1);
+            
+            if dim == 3 && nodesPerElem >= 4
+                % 3D 四面体体积计算
+                % V = |det(v1, v2, v3)| / 6
+                % 向量化计算: V = |dot(cross(v1, v2), v3)| / 6
+                
+                % 提取四个顶点的坐标
+                p1 = obj.P(:, obj.T(1,:));
+                p2 = obj.P(:, obj.T(2,:));
+                p3 = obj.P(:, obj.T(3,:));
+                p4 = obj.P(:, obj.T(4,:));
+                
+                v1 = p2 - p1;
+                v2 = p3 - p1;
+                v3 = p4 - p1;
+                
+                % cross(v1, v2, 1) 表示沿第一维度(行)做叉乘
+                cp = cross(v1, v2, 1);
+                
+                % 点乘后取绝对值，除以 6
+                obj.CellVolumes = abs(sum(cp .* v3, 1)) / 6.0;
+                
+            elseif dim == 2 && nodesPerElem >= 3
+                % 2D 三角形面积计算 (作为体积处理)
+                p1 = obj.P(:, obj.T(1,:));
+                p2 = obj.P(:, obj.T(2,:));
+                p3 = obj.P(:, obj.T(3,:));
+                
+                v1 = p2 - p1;
+                v2 = p3 - p1;
+                
+                % 2D 叉乘模长: |x1*y2 - x2*y1|
+                obj.CellVolumes = 0.5 * abs(v1(1,:).*v2(2,:) - v1(2,:).*v2(1,:));
+            else
+                warning('Mesh:Volume', 'Volume calculation not implemented for this element type. CellVolumes will be empty.');
+                obj.CellVolumes = [];
+            end
+        end
+        
         function generateEdges(obj)
             if ~isempty(obj.Edges), return; end
             
@@ -85,52 +138,23 @@ classdef Mesh < handle
         end
         
         function generateFaces(obj)
-            % GENERATEFACES 生成四面体网格的面拓扑 (Triangular Faces)
-            %
-            % 功能:
-            %   从四面体连接关系 (obj.T) 中提取所有唯一的三角形面，
-            %   并存储在 obj.Faces 中。
-            %   (如果 obj.Faces 已存在且包含数据，该函数可能会覆盖它以确保包含内部面)
-            
-            % 如果需要强制重新生成，可注释掉下面这行
+            % GENERATEFACES 生成四面体网格的面拓扑
             if ~isempty(obj.Faces) && size(obj.Faces, 2) > size(obj.T, 2), return; end
             
             fprintf('[Mesh] Generating Face topology...\n');
-            
-            % 四面体的4个面 (局部节点索引定义)
-            % 组合: [1 2 3], [1 2 4], [1 3 4], [2 3 4]
             local_face_defs = [1 2 3; 1 2 4; 1 3 4; 2 3 4];
             
-            % 预分配/构造大矩阵
-            % obj.T 是 [4 x N_elems]
-            
-            % 提取所有单元的4个面
-            % 为了向量化操作，我们将所有面堆叠起来
-            F1 = obj.T(local_face_defs(1,:), :)'; % [N_elems x 3]
+            F1 = obj.T(local_face_defs(1,:), :)';
             F2 = obj.T(local_face_defs(2,:), :)';
             F3 = obj.T(local_face_defs(3,:), :)';
             F4 = obj.T(local_face_defs(4,:), :)';
             
-            % 合并所有面: [4*N_elems x 3]
             all_raw_faces = [F1; F2; F3; F4];
-            
-            % 对每个面的节点索引进行排序 (行内排序)，以确保唯一性判断不受节点顺序影响
-            % 例如 [3 1 2] 和 [1 2 3] 被视为同一个面
             all_sorted_faces = sort(all_raw_faces, 2);
-            
-            % 使用 unique 函数查找唯一面
-            % 'rows' 表示按行比较
             unique_faces = unique(all_sorted_faces, 'rows');
             
-            % 转置并存储结果: [3 x N_unique_faces]
             obj.Faces = unique_faces';
-            
-            % 这里的 NumFaces 是所有面（包括内部面和边界面）的总数
             fprintf('[Mesh] Faces generated: %d unique faces found.\n', size(obj.Faces, 2));
-            
-            % (可选) 如果您以后需要单元到面的映射 (T2F)，可以在这里扩展:
-            % [unique_faces, ~, ic] = unique(...);
-            % obj.T2F = reshape(ic, [], 4)';
         end
         
         function stats(obj)
@@ -142,6 +166,9 @@ classdef Mesh < handle
             end
             if ~isempty(obj.Faces)
                 fprintf('Faces: %d\n', size(obj.Faces, 2));
+            end
+            if ~isempty(obj.CellVolumes)
+                fprintf('Total Volume: %.4e m^3\n', sum(obj.CellVolumes));
             end
         end
     end
