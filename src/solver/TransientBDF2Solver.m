@@ -128,6 +128,7 @@ classdef TransientBDF2Solver < handle
             numSteps = length(timeSteps);
             currentHistory = zeros(numSteps, numWindings); 
             probeB_History = zeros(numSteps, 1);
+            times = zeros(numSteps, 1);
             currentTime = 0;
             
             % ==================================================
@@ -136,6 +137,7 @@ classdef TransientBDF2Solver < handle
             for t_idx = 1:numSteps
                 dt = timeSteps(t_idx);
                 currentTime = currentTime + dt;
+                times(t_idx) = currentTime;
                 
                 % --- [BDF 系数选择] ---
                 if t_idx == 1
@@ -245,13 +247,14 @@ classdef TransientBDF2Solver < handle
                 end
             end
             
+            info.times = times;
             info.FinalTime = currentTime; 
             info.CurrentHistory = currentHistory;
             if ~isempty(probePoint), info.ProbeB_History = probeB_History; end
         end
     end
     
-    methods (Access = private)
+    methods (Access = protected)
         
         function scaleFactors = calculateCircuitScale(obj, ctx, dt)
             % [GeoBalance Restore] 严格遵循原版采样逻辑
