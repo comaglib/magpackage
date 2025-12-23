@@ -106,7 +106,7 @@ solver.LinearSolver.MumpsSymmetry = 0;
 solver.LinearSolver.MumpsICNTL.i14 = 300;
 
 % 4.3 时间步进
-dt = 5e-5;
+dt = 1e-3;
 timeSim = 0.015;    % 总时长
 % timeSteps = repmat(dt, round(timeSim/dt), 1);
 timeSteps = [repmat(5e-4, round(solver.BreakerTime/(5e-4)), 1);
