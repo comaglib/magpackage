@@ -36,7 +36,7 @@ classdef BDF2BreakerSolver < TransientBDF2Solver
                                                  probePoint)
             
             fprintf('==================================================\n');
-            fprintf('   Breaker Solver (BDF2) - PostProc Integrated    \n');
+            fprintf('   Breaker Solver (BDF2) - Effective Sigma Mode   \n');
             fprintf('==================================================\n');
             
             % -----------------------------------------------------------
@@ -61,9 +61,14 @@ classdef BDF2BreakerSolver < TransientBDF2Solver
             
             % 矩阵组装
             fprintf('   [Init] Assembling invariant matrices...\n');
+            % M_sigma: 带电导率权重的质量矩阵 (用于计算涡流项及后处理功率)
+            % 注意：如果 sigmaMap 中铁芯设为 5e5，这个矩阵就不为零
             M_sigma_local = obj.Assembler.assembleMassWeighted(space_A, sigmaMap);
             [mi, mj, mv] = find(M_sigma_local);
             ctx.M_sigma = sparse(mi, mj, mv, ctx.numTotalDofs, ctx.numTotalDofs);
+            
+            % 提取纯电磁部分的 M_sigma (用于快速计算功率)
+            ctx.M_sigma_AA = ctx.M_sigma(1:ctx.num_A, 1:ctx.num_A);
             
             C_AP_local = obj.Assembler.assembleCoupling(space_A, space_P, 1.0);
             [ci, cj, cv] = find(C_AP_local);
@@ -74,7 +79,7 @@ classdef BDF2BreakerSolver < TransientBDF2Solver
             n_rows_W = size(W_fem_mat, 1);
             ctx.W_mat(1:n_rows_W, :) = W_fem_mat;
             
-            % Scaling
+            % Circuit Scaling
             dt_init = timeSteps(1);
             ctx.CircuitRowScale = obj.calculateCircuitScale(ctx, dt_init);
             fprintf('   [Init] Circuit Scale Factor: %.4e\n', ctx.CircuitRowScale(1));
@@ -96,8 +101,6 @@ classdef BDF2BreakerSolver < TransientBDF2Solver
             % 2. 监测器与后处理对象初始化
             % -----------------------------------------------------------
             I_initial = x_curr(numFemDofs+1 : end); 
-            
-            % 初始化 PostProcessor (复用 Assembler)
             postProc = PostProcessor(obj.Assembler); 
             
             B_mag_initial = 0;
@@ -117,8 +120,7 @@ classdef BDF2BreakerSolver < TransientBDF2Solver
                 end
             end
             
-            % 计算 t=0 时刻的精确磁能 (利用 PostProcessor)
-            % 注意: PostProcessor 需要纯 A 场向量
+            % 计算初始磁能
             A_init = x_curr(1:ctx.num_A);
             W_mag_prev_exact = postProc.computeMagneticEnergy(A_init, matLib);
             
@@ -135,7 +137,6 @@ classdef BDF2BreakerSolver < TransientBDF2Solver
             energyLog.P_eddy = zeros(numSteps, 1); 
             energyLog.LossRatio = zeros(numSteps, 1);
             
-            % 复位累积状态
             obj.I_prev_audit = zeros(numWindings, 1);
             obj.Hist_W_mag = W_mag_prev_exact; 
             obj.Hist_E_ohm_cum = 0; 
@@ -153,14 +154,13 @@ classdef BDF2BreakerSolver < TransientBDF2Solver
                 dt = timeSteps(t_idx);
                 currentTime = currentTime + dt;
                 
-                % Breaker Logic: > (Time + 1e-9)
                 isBreakerOpen = currentTime > (obj.BreakerTime + 1e-9);
                 breakerStatus = "CLOSED"; if isBreakerOpen, breakerStatus = "OPEN"; end
                 
                 fprintf('\n--- Step %d/%d | t=%.5fs | dt=%.1e | Breaker: %s ---\n', ...
                         t_idx, numSteps, currentTime, dt, breakerStatus);
                 
-                % BDF coefficients
+                % BDF Coefficients
                 if t_idx == 1
                     alpha_t = 1.0 / dt;
                     beta_t_vec = -ctx.x_prev / dt;
@@ -188,7 +188,7 @@ classdef BDF2BreakerSolver < TransientBDF2Solver
                 for iter = 1:obj.MaxIterations
                     [J_sys, Res_vec] = obj.assembleNewtonSystem(x_curr, ctx);
                     
-                    % Apply Breaker Constraints
+                    % 处理开路状态 (强制电流为0，修改对角元)
                     if isBreakerOpen
                         idx_circuit = (numFemDofs + 1 : ctx.numTotalDofs)';
                         J_sys(idx_circuit, :) = 0;
@@ -213,7 +213,6 @@ classdef BDF2BreakerSolver < TransientBDF2Solver
                     [J_bc, Res_bc] = BoundaryCondition.applyDirichlet(J_sys, Res_vec, ctx.fixedDofs);
                     dx = obj.LinearSolver.solve(J_bc, -Res_bc);
                     
-                    % Line Search
                     alpha = 1.0; 
                     if obj.UseLineSearch
                         for k = 0:obj.MaxLineSearchIters
@@ -247,38 +246,50 @@ classdef BDF2BreakerSolver < TransientBDF2Solver
                 end
                 
                 % =======================================================
-                % 精确能量审计 (直接调用 PostProcessor)
+                % [关键修改] 能量审计: 使用 Solver 计算的宏观涡流损耗
                 % =======================================================
                 
-                % 1. 调用 PostProcessor 计算全场磁能
-                %    (内部会自动处理非线性积分)
                 W_mag_current_exact = postProc.computeMagneticEnergy(A_sol, matLib);
                 
                 if t_idx > 1
-                    % 1.1 磁场储能变化
                     d_W_mag = W_mag_current_exact - W_mag_prev_exact;
                     obj.Hist_W_mag = W_mag_current_exact;
                     
-                    % 2. 线圈电阻损耗
+                    % 1. 线圈电阻损耗 (Circuit Ohmic Loss)
+                    %    这部分来自电路方程 R * I^2
                     d_E_ohm = sum((I_step.^2) * obj.R_winding_Audit * dt);
                     obj.Hist_E_ohm_cum = obj.Hist_E_ohm_cum + d_E_ohm;
                     
-                    % 3. 涡流损耗 (直接利用质量矩阵计算)
-                    %    P_eddy = (dA/dt)' * M_sigma * (dA/dt)
-                    dx_dt = ctx.bdf_alpha * x_curr + ctx.bdf_beta_vec;
-                    P_eddy_inst = dx_dt' * ctx.M_sigma * dx_dt;
-                    d_E_eddy = P_eddy_inst * dt;
-                    obj.Hist_E_eddy_cum = obj.Hist_E_eddy_cum + d_E_eddy;
-                    energyLog.P_eddy(t_idx) = P_eddy_inst;
+                    % 2. 铁芯涡流损耗 (Core Macro Eddy Loss) - 基于 Solver 矩阵计算
+                    %    公式: P = integral( sigma * |dA/dt|^2 ) dV
+                    %    离散: P = (dA/dt)' * M_sigma * (dA/dt)
                     
-                    % 4. 源输入
+                    %    a. 计算 dA/dt
+                    dx_dt = ctx.bdf_alpha * x_curr + ctx.bdf_beta_vec;
+                    dA_dt_val = dx_dt(1:ctx.num_A);
+                    
+                    %    b. 矩阵向量乘法计算功率 (W)
+                    %       注意: M_sigma 是带电导率权重的。
+                    %       因为 sigma_coil=0, sigma_air=0，所以这里算出来的纯粹是 Core 的损耗
+                    P_solver_eddy = dA_dt_val' * ctx.M_sigma_AA * dA_dt_val;
+                    
+                    %    c. 计算能量 (J)
+                    d_E_core = P_solver_eddy * dt;
+                    obj.Hist_E_eddy_cum = obj.Hist_E_eddy_cum + d_E_core;
+                    
+                    %    d. 记录日志 (总物理损耗功率)
+                    P_coil_inst = sum((I_step.^2) * obj.R_winding_Audit);
+                    energyLog.P_eddy(t_idx) = P_coil_inst + P_solver_eddy;
+                    
+                    % 3. 源输入
                     d_E_source = 0;
                     if ~isBreakerOpen
                         d_E_source = sum(V_vals .* I_step * dt); 
                     end
                     
-                    % 5. 数值耗散
-                    d_E_num = d_E_source - (d_W_mag + d_E_ohm + d_E_eddy);
+                    % 4. 数值耗散审计
+                    %    Residual = Source - (dW + Ohm_Coil + Eddy_Core)
+                    d_E_num = d_E_source - (d_W_mag + d_E_ohm + d_E_core);
                     obj.Hist_E_num_cum = obj.Hist_E_num_cum + d_E_num;
                     
                     energyLog.P_num(t_idx) = d_E_num / dt;

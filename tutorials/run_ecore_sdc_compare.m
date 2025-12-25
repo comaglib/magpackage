@@ -44,10 +44,10 @@ matLib = containers.Map('KeyType', 'double', 'ValueType', 'any');
 % B-H 曲线数据 (DW465-50 硅钢片)
 B_data = [0, 0.1, 0.2, 0.3001, 0.4, 0.5001, 0.6001, 0.7, 0.8, 0.9001, 1, ...
           1.1001, 1.2001, 1.3002, 1.4, 1.4999, 1.5999, 1.6991, 1.7987, 1.8978, ...
-          1.98, 1.9925, 2.118164];
+          1.98, 1.9925, 2.118164, 3.37480104];
 H_data = [0, 7.86, 13.99, 19.51, 24.58, 29.42, 34.07, 38.64, 43.12, 47.59, 52.1, ...
           56.77, 61.67, 67.19, 74.03, 83.86, 1.00E+02, 1.38E+02, 2.95E+02, 1.01E+03, ...
-          2500, 12500, 112500];
+          2500, 12500, 112500, 1112500];
 
 % 创建非线性材料 (自动应用 PCHIP 平滑和真空修正)
 matLib(tag_core) = MaterialLib.createNonlinear(B_data, H_data);
@@ -75,7 +75,7 @@ dofHandler.distributeDofs(space_P);
 [center, radius, area_S, axis_idx] = CoilGeometryUtils.autoDetectCircular(mesh, NEW_TAG_PRIM);
 dir_map = -1.0 * CoilGeometryUtils.computeCircularDirection(mesh, NEW_TAG_PRIM, center, axis_idx);
 
-R = 0.2;
+R = 8;
 winding = Winding('Primary', NEW_TAG_PRIM, 3000, R, area_S, [0,0,0]);
 winding.setDirectionField(dir_map);
 
@@ -88,7 +88,7 @@ circuit.L = 0;  % 漏电感 (H)
 % circuit.V_source_func = @(t) voltage * sin(2 * pi * 50 * t);
 % 定义分段激励函数
 % 物理含义：50Hz 正弦波，幅值 voltage，在 t=0.01s 时刻切断（归零）
-timeDisc = 0.01;
+timeDisc = 100;
 circuit.V_source_func = @(t) voltage * sin(2 * pi * 50 * t) .* (t < timeDisc);
 
 % 1.7 边界条件与组装器
@@ -122,7 +122,7 @@ probePoint = [0, 0, 0];
 %% --- 3. 运行 BDF2 (Reference) ---
 fprintf('\n[Run 1] Standard BDF2 Solver (Fine Step)...\n');
 
-dt_bdf = 1e-2;
+dt_bdf = 5e-3;
 timeSim = 0.02*5;
 timeSteps_bdf = repmat(dt_bdf, round(timeSim/dt_bdf), 1);
 % timeSteps_bdf = [repmat(5e-4, round(timeDisc/(5e-4)), 1);
@@ -130,8 +130,8 @@ timeSteps_bdf = repmat(dt_bdf, round(timeSim/dt_bdf), 1);
 
 tic;
 solver_bdf = TransientBDF2Solver(assembler);
-solver_bdf.Tolerance = 1e-3;
-solver_bdf.RelTolerance = 1e-3;
+solver_bdf.Tolerance = 1e-4;
+solver_bdf.RelTolerance = 1e-4;
 
 % 定义绘图回调函数句柄
 % 注意: 求解器会自动传入 (t, I, t_vec, I_vec, B_curr, B_hist)

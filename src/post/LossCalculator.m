@@ -112,5 +112,67 @@ classdef LossCalculator < handle
             dot_prod = sum(c .* d3, 1);
             vols = abs(dot_prod)' / 6.0;
         end
+        
+        function P_loss = computeBertottiLoss_TimeStep(obj, dA_dt_col, matLib)
+            % COMPUTEBERTOTTILOSS_TIMESTEP 计算单步瞬时损耗
+            % 基于 Bertotti 分离模型: P_total = P_classic + P_excess + P_hyst
+            
+            % 1. 计算 dB/dt 场
+            %    B = curl(A) => dB/dt = curl(dA/dt)
+            %    [修复] 显式指定 'Nedelec_P1' 空间，防止自动匹配到 Lagrange 空间导致索引越界
+            dB_dt_elems = obj.PostProcessor.computeElementB(dA_dt_col, 'Nedelec_P1'); % [3 x Ne]
+            
+            % 2. 计算模长 |dB/dt|
+            dB_dt_mag = obj.PostProcessor.computeMagnitude(dB_dt_elems); % [Ne x 1]
+            
+            % 3. 获取单元体积
+            Vols = obj.computeElementVolumes();
+            
+            % 4. 遍历材料区域进行积分
+            P_classic = 0;
+            P_excess = 0;
+            
+            mesh = obj.Assembler.Mesh;
+            tags = mesh.RegionTags;
+            uTags = unique(tags);
+            
+            for k = 1:length(uTags)
+                tag = uTags(k);
+                
+                % 获取材料数据
+                if isa(matLib, 'containers.Map') && matLib.isKey(tag)
+                    mat = matLib(tag);
+                elseif isnumeric(matLib) && tag <= length(matLib)
+                    mat = matLib(tag);
+                else
+                    continue; 
+                end
+                
+                % 仅对定义了叠片参数的材料计算
+                if isfield(mat, 'Lam_d') && isfield(mat, 'Lam_sigma')
+                    mask = (tags == tag);
+                    if ~any(mask), continue; end
+                    
+                    vol_sub = Vols(mask);
+                    dB_dt_sub = dB_dt_mag(mask);
+                    
+                    % === A. 经典涡流损耗 (Classical Eddy Current Loss) ===
+                    % 公式: P = (sigma * d^2 / 12) * (dB/dt)^2 * Vol
+                    coeff_cl = (mat.Lam_sigma * mat.Lam_d^2) / 12.0;
+                    p_dens_cl = coeff_cl * (dB_dt_sub .^ 2);
+                    P_classic = P_classic + sum(p_dens_cl .* vol_sub);
+                    
+                    % === B. 异常损耗 (Excess Loss) ===
+                    if isfield(mat, 'Loss_Kexc') && ~isempty(mat.Loss_Kexc) && mat.Loss_Kexc > 0
+                        p_dens_exc = mat.Loss_Kexc * (dB_dt_sub .^ 1.5);
+                        P_excess = P_excess + sum(p_dens_exc .* vol_sub);
+                    end
+                end
+            end
+            
+            P_loss.Classic = P_classic;
+            P_loss.Excess = P_excess;
+            P_loss.Total = P_classic + P_excess;
+        end
     end
 end

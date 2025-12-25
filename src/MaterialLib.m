@@ -123,5 +123,21 @@ classdef MaterialLib
             % 计算导数样条 (用于 Jacobian)
             matData.SplineDNu = fnder(matData.SplineNu, 1);
         end
+        
+        function matData = setBertottiParams(matData, d, sigma_sheet, kh, alpha, kexc)
+            % SETBERTOTTIPARAMS 设置 Bertotti 损耗参数
+            % 输入:
+            %   d:           叠片厚度 (m), e.g., 0.35e-3
+            %   sigma_sheet: 硅钢片内部真实电导率 (S/m), e.g., 2e6
+            %   kh:          磁滞损耗系数 (W/m^3 / Hz / T^alpha)
+            %   alpha:       磁滞指数 (通常 1.6 ~ 2.0)
+            %   kexc:        异常损耗系数 (可选)
+            
+            matData.Lam_d = d;
+            matData.Lam_sigma = sigma_sheet;
+            matData.Loss_Kh = kh;
+            matData.Loss_Alpha = alpha;
+            matData.Loss_Kexc = kexc;
+        end
     end
 end
